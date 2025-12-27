@@ -1,0 +1,19 @@
+{
+    "machine": {
+        "width_mm": 1219.2,
+        "height_mm": 1524.0
+    },
+    "work_area": {
+        "left": -420.5,
+        "right": 420.5,
+        "top": 594.5,
+        "bottom": -594.5
+    },
+    "pen": {
+        "up_angle": 90,
+        "down_angle": 40,
+        "travel_speed": 1000,
+        "draw_speed": 500
+    }
+}
+

@@ -1,0 +1,44 @@
+[project]
+name = "dcode"
+version = "0.1.0"
+description = "Diffusion models for gcode generation"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "torch>=2.0",
+    "diffusers>=0.25",
+    "transformers>=4.36",
+    "accelerate>=0.25",
+    "datasets>=2.16",
+    "wandb>=0.16",
+    "kaggle>=1.6",
+    "huggingface-hub>=0.20",
+    "pillow>=10.0",
+    "numpy>=1.24",
+    "tqdm>=4.66",
+    "pydantic>=2.5",
+    "click>=8.1",
+    "optuna>=3.5",
+]
+
+[project.optional-dependencies]
+dev = ["ruff>=0.1", "pytest>=7.4"]
+ray = ["ray[tune]>=2.9"]
+
+[project.scripts]
+dcode = "dcode.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["dcode"]
+
