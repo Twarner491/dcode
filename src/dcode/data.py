@@ -1,6 +1,8 @@
-"""Dataset generation: images -> gcode pairs with multiple algorithm permutations."""
+"""Dataset generation: images -> gcode pairs with multiprocessing."""
 
 import json
+import multiprocessing as mp
+from functools import partial
 from pathlib import Path
 
 from PIL import Image
@@ -11,13 +13,57 @@ from .converter import ALGORITHM_PERMUTATIONS, ImageConverter
 from .gcode import GcodeExporter
 
 
+def _process_image(args, config_dict, output_dir):
+    """Process single image with all algorithms (worker function)."""
+    img_path, algorithms = args
+    config = Config(**config_dict)
+    converter = ImageConverter(config)
+    exporter = GcodeExporter(config)
+
+    images_dir = Path(output_dir) / "images"
+    gcode_dir = Path(output_dir) / "gcode"
+
+    results = []
+    stem = img_path.stem
+
+    try:
+        img = Image.open(img_path).convert("RGB")
+        img.thumbnail((512, 512), Image.Resampling.LANCZOS)
+    except Exception as e:
+        return [], [{"path": str(img_path), "error": str(e)}]
+
+    for algo in algorithms:
+        permutations = ALGORITHM_PERMUTATIONS.get(algo, [{}])
+        for perm_idx, options in enumerate(permutations):
+            suffix = f"{algo}_{perm_idx}"
+            out_img = images_dir / f"{stem}_{suffix}.png"
+            out_gcode = gcode_dir / f"{stem}_{suffix}.gcode"
+
+            try:
+                img.save(out_img)
+                turtle = converter.convert(img, algo, options)
+                comment = f"Source: {img_path.name} | Algorithm: {algo} | Options: {options}"
+                gcode = exporter.export(turtle, comment)
+                out_gcode.write_text(gcode)
+
+                results.append({
+                    "image": str(out_img),
+                    "gcode": str(out_gcode),
+                    "algorithm": algo,
+                    "options": options,
+                    "source": str(img_path),
+                })
+            except Exception:
+                pass
+
+    return results, []
+
+
 class DataGenerator:
-    """Generates image-gcode pairs using multiple algorithms and settings."""
+    """Generates image-gcode pairs using multiple algorithms (parallelized)."""
 
     def __init__(self, config: Config | None = None):
         self.config = config or Config()
-        self.converter = ImageConverter(self.config)
-        self.exporter = GcodeExporter(self.config)
 
     def generate_dataset(
         self,
@@ -25,81 +71,60 @@ class DataGenerator:
         output_dir: Path,
         max_samples: int | None = None,
         algorithms: list[str] | None = None,
+        num_workers: int | None = None,
     ) -> dict:
-        """Generate dataset with multiple permutations per image."""
+        """Generate dataset with multiprocessing."""
         output_dir.mkdir(parents=True, exist_ok=True)
         images_dir = output_dir / "images"
         gcode_dir = output_dir / "gcode"
         images_dir.mkdir(exist_ok=True)
         gcode_dir.mkdir(exist_ok=True)
 
-        # Find all images
+        # Find images
         image_files = []
-        for ext in ["*.jpg", "*.jpeg", "*.png", "*.bmp"]:
+        for ext in ["*.jpg", "*.jpeg", "*.png", "*.bmp", "*.JPG", "*.JPEG", "*.PNG"]:
             image_files.extend(input_dir.glob(f"**/{ext}"))
 
         if max_samples:
             image_files = image_files[:max_samples]
 
-        # Use specified algorithms or all
         algos = algorithms or list(ALGORITHM_PERMUTATIONS.keys())
+        num_workers = num_workers or mp.cpu_count()
 
-        manifest = {"pairs": [], "failed": [], "stats": {"algorithms": {}}}
+        # Prepare args
+        args_list = [(img, algos) for img in image_files]
+        config_dict = self.config.model_dump()
 
-        for img_path in tqdm(image_files, desc="Converting"):
-            try:
-                img = Image.open(img_path).convert("RGB")
-                img.thumbnail((512, 512), Image.Resampling.LANCZOS)
-            except Exception as e:
-                manifest["failed"].append({"path": str(img_path), "error": str(e)})
-                continue
+        # Process in parallel
+        worker_fn = partial(_process_image, config_dict=config_dict, output_dir=str(output_dir))
 
-            stem = img_path.stem
+        all_pairs = []
+        all_failed = []
 
-            # Generate all algorithm/setting permutations
-            for algo in algos:
-                permutations = ALGORITHM_PERMUTATIONS.get(algo, [{}])
+        with mp.Pool(num_workers) as pool:
+            results = list(tqdm(
+                pool.imap(worker_fn, args_list),
+                total=len(args_list),
+                desc=f"Converting ({num_workers} workers)",
+            ))
 
-                for perm_idx, options in enumerate(permutations):
-                    suffix = f"{algo}_{perm_idx}"
-                    out_img = images_dir / f"{stem}_{suffix}.png"
-                    out_gcode = gcode_dir / f"{stem}_{suffix}.gcode"
+        for pairs, failed in results:
+            all_pairs.extend(pairs)
+            all_failed.extend(failed)
 
-                    try:
-                        # Save normalized image
-                        img.save(out_img)
-
-                        # Convert to paths
-                        turtle = self.converter.convert(img, algo, options)
-
-                        # Export gcode
-                        comment = f"Source: {img_path.name} | Algorithm: {algo} | Options: {options}"
-                        gcode = self.exporter.export(turtle, comment)
-
-                        out_gcode.write_text(gcode)
-
-                        manifest["pairs"].append({
-                            "image": str(out_img),
-                            "gcode": str(out_gcode),
-                            "algorithm": algo,
-                            "options": options,
-                            "source": str(img_path),
-                        })
-
-                        # Track stats
-                        if algo not in manifest["stats"]["algorithms"]:
-                            manifest["stats"]["algorithms"][algo] = 0
-                        manifest["stats"]["algorithms"][algo] += 1
-
-                    except Exception as e:
-                        manifest["failed"].append({
-                            "path": str(img_path),
-                            "algorithm": algo,
-                            "error": str(e),
-                        })
-
-        manifest["stats"]["total_pairs"] = len(manifest["pairs"])
-        manifest["stats"]["total_failed"] = len(manifest["failed"])
+        # Build manifest
+        manifest = {
+            "pairs": all_pairs,
+            "failed": all_failed,
+            "stats": {
+                "total_pairs": len(all_pairs),
+                "total_failed": len(all_failed),
+                "algorithms": {},
+            },
+        }
+        for p in all_pairs:
+            algo = p["algorithm"]
+            manifest["stats"]["algorithms"][algo] = manifest["stats"]["algorithms"].get(algo, 0) + 1
 
         manifest_path = output_dir / "manifest.json"
         with open(manifest_path, "w") as f:

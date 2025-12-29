@@ -1,0 +1,3 @@
+[submodule "spaces/dcode"]
+	path = spaces/dcode
+	url = https://huggingface.co/spaces/twarner/dcode
