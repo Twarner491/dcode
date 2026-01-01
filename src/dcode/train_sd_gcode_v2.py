@@ -53,6 +53,7 @@ class GcodeDecoder(nn.Module):
     def __init__(self, config: GcodeDecoderConfig):
         super().__init__()
         self.config = config
+        self.gradient_checkpointing = False
         
         self.latent_proj = nn.Sequential(
             nn.Linear(config.latent_dim, config.hidden_size * 4),
@@ -64,20 +65,26 @@ class GcodeDecoder(nn.Module):
         self.token_embed = nn.Embedding(config.vocab_size, config.hidden_size)
         self.pos_embed = nn.Embedding(config.max_seq_len, config.hidden_size)
         
-        decoder_layer = nn.TransformerDecoderLayer(
-            d_model=config.hidden_size,
-            nhead=config.num_heads,
-            dim_feedforward=config.hidden_size * 4,
-            dropout=config.dropout,
-            activation='gelu',
-            batch_first=True,
-            norm_first=True,
-        )
-        self.decoder = nn.TransformerDecoder(decoder_layer, config.num_layers)
+        # Individual layers for gradient checkpointing
+        self.layers = nn.ModuleList([
+            nn.TransformerDecoderLayer(
+                d_model=config.hidden_size,
+                nhead=config.num_heads,
+                dim_feedforward=config.hidden_size * 4,
+                dropout=config.dropout,
+                activation='gelu',
+                batch_first=True,
+                norm_first=True,
+            )
+            for _ in range(config.num_layers)
+        ])
         
         self.ln_f = nn.LayerNorm(config.hidden_size)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.lm_head.weight = self.token_embed.weight
+    
+    def enable_gradient_checkpointing(self):
+        self.gradient_checkpointing = True
         
     def forward(self, latent: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len = input_ids.shape
@@ -92,7 +99,16 @@ class GcodeDecoder(nn.Module):
         
         causal_mask = nn.Transformer.generate_square_subsequent_mask(seq_len, device=device)
         
-        x = self.decoder(x, memory, tgt_mask=causal_mask)
+        # Apply layers with optional checkpointing
+        for layer in self.layers:
+            if self.gradient_checkpointing and self.training:
+                x = torch.utils.checkpoint.checkpoint(
+                    layer, x, memory, causal_mask,
+                    use_reentrant=False
+                )
+            else:
+                x = layer(x, memory, tgt_mask=causal_mask)
+        
         x = self.ln_f(x)
         return self.lm_head(x)
 
@@ -304,10 +320,11 @@ def train(
         max_seq_len=max_gcode_len,
     )
     decoder = GcodeDecoder(config).to(device)
+    decoder.enable_gradient_checkpointing()  # Save ~50% memory
     decoder.train()
     
     num_params = sum(p.numel() for p in decoder.parameters())
-    print(f"Decoder params: {num_params:,} ({num_params/1e6:.1f}M)")
+    print(f"Decoder params: {num_params:,} ({num_params/1e6:.1f}M) [gradient checkpointing ON]")
     
     # Optimizer - ONLY decoder (SD is frozen)
     optimizer = torch.optim.AdamW(decoder.parameters(), lr=learning_rate)

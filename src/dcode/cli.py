@@ -255,8 +255,8 @@ def infer_sd_gcode(prompt: str, model: Path, output: Path | None, temperature: f
 @click.option("--output", "-o", default="checkpoints/sd_gcode_v2", type=Path)
 @click.option("--sd-model", default="runwayml/stable-diffusion-v1-5")
 @click.option("--epochs", "-e", default=10, type=int)
-@click.option("--batch-size", "-b", default=8, type=int)
-@click.option("--grad-accum", default=4, type=int)
+@click.option("--batch-size", "-b", default=32, type=int, help="Per-GPU batch (32 fits H100 80GB)")
+@click.option("--grad-accum", default=4, type=int, help="Gradient accumulation (effective = batch * accum)")
 @click.option("--lr", default=1e-4, type=float)
 @click.option("--max-len", default=1024, type=int)
 def train_sd_gcode_v2(
