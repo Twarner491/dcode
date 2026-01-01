@@ -223,7 +223,7 @@ def train(
         dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=4,
+        num_workers=0,  # CUDA doesn't work with forked workers
         pin_memory=True,
         drop_last=True,
     )
