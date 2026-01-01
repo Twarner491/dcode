@@ -132,5 +132,123 @@ def models():
         click.echo(f"{name}: {cfg.hf_id} ({cfg.type.value})")
 
 
+@main.command("train-diffusion")
+@click.option("--manifest", "-m", required=True, type=Path)
+@click.option("--output", "-o", default="checkpoints/latent_gcode", type=Path)
+@click.option("--epochs", "-e", default=10, type=int)
+@click.option("--batch-size", "-b", default=4, type=int)
+@click.option("--lr", default=1e-4, type=float)
+@click.option("--max-len", default=1024, type=int)  # Reduced for memory
+@click.option("--grad-accum", default=4, type=int)
+def train_diffusion(manifest: Path, output: Path, epochs: int, batch_size: int, lr: float, max_len: int, grad_accum: int):
+    """Train latent-to-gcode diffusion model."""
+    from .train_diffusion import train
+
+    result = train(
+        manifest_path=str(manifest),
+        output_dir=str(output),
+        epochs=epochs,
+        batch_size=batch_size,
+        learning_rate=lr,
+        max_gcode_len=max_len,
+        gradient_accumulation=grad_accum,
+    )
+    click.echo(f"Saved: {result}")
+
+
+@main.command("infer-diffusion")
+@click.argument("prompt")
+@click.option("--model", "-m", required=True, type=Path, help="Trained latent-gcode model")
+@click.option("--sd-model", default="stabilityai/stable-diffusion-2-1-base")
+@click.option("--output", "-o", type=Path)
+@click.option("--image-output", type=Path)
+@click.option("--temperature", "-t", default=0.8, type=float)
+@click.option("--steps", default=30, type=int)
+@click.option("--seed", "-s", type=int)
+def infer_diffusion(prompt: str, model: Path, sd_model: str, output: Path | None, image_output: Path | None, temperature: float, steps: int, seed: int | None):
+    """Generate gcode from text using diffusion model."""
+    from .inference_diffusion import DcodeInference
+
+    inferencer = DcodeInference(str(model), sd_model)
+    gcode, image = inferencer.generate(
+        prompt,
+        num_inference_steps=steps,
+        temperature=temperature,
+        seed=seed,
+    )
+
+    if output:
+        output.write_text(gcode)
+        click.echo(f"Gcode saved: {output}")
+    else:
+        click.echo(gcode[:1000])
+
+    if image_output:
+        image.save(image_output)
+        click.echo(f"Image saved: {image_output}")
+
+
+@main.command("train-sd-gcode")
+@click.option("--manifest", "-m", required=True, type=Path)
+@click.option("--output", "-o", default="checkpoints/sd_gcode", type=Path)
+@click.option("--sd-model", default="runwayml/stable-diffusion-v1-5")
+@click.option("--epochs", "-e", default=10, type=int)
+@click.option("--batch-size", "-b", default=2, type=int)
+@click.option("--grad-accum", default=16, type=int)
+@click.option("--lr", default=1e-5, type=float)
+@click.option("--max-len", default=512, type=int)
+@click.option("--diffusion-steps", default=10, type=int)
+@click.option("--seed", "-s", default=42, type=int)
+def train_sd_gcode(
+    manifest: Path, output: Path, sd_model: str, epochs: int, 
+    batch_size: int, grad_accum: int, lr: float, max_len: int, 
+    diffusion_steps: int, seed: int
+):
+    """Post-train Stable Diffusion for text→gcode (single model, end-to-end)."""
+    from .train_sd_gcode import train
+
+    result = train(
+        manifest_path=str(manifest),
+        output_dir=str(output),
+        sd_model=sd_model,
+        epochs=epochs,
+        batch_size=batch_size,
+        gradient_accumulation=grad_accum,
+        learning_rate=lr,
+        max_gcode_len=max_len,
+        num_diffusion_steps=diffusion_steps,
+        seed=seed,
+    )
+    click.echo(f"Saved: {result}")
+
+
+@main.command("infer-sd-gcode")
+@click.argument("prompt")
+@click.option("--model", "-m", required=True, type=Path, help="Trained SD-Gcode model")
+@click.option("--output", "-o", type=Path)
+@click.option("--temperature", "-t", default=0.8, type=float)
+@click.option("--steps", default=20, type=int)
+@click.option("--max-len", default=512, type=int)
+def infer_sd_gcode(prompt: str, model: Path, output: Path | None, temperature: float, steps: int, max_len: int):
+    """Generate gcode from text using post-trained SD model."""
+    from .sd_gcode import SDGcodeModel
+
+    model_obj = SDGcodeModel.from_pretrained(str(model))
+    model_obj.eval()
+    
+    gcode = model_obj.generate(
+        prompt,
+        num_diffusion_steps=steps,
+        max_gcode_length=max_len,
+        temperature=temperature,
+    )
+
+    if output:
+        output.write_text(gcode)
+        click.echo(f"Saved: {output}")
+    else:
+        click.echo(gcode)
+
+
 if __name__ == "__main__":
     main()

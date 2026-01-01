@@ -6,7 +6,11 @@ from huggingface_hub import HfApi, create_repo
 
 api = HfApi()
 
-# Best model - full upload
+# Diffusion model
+DIFFUSION_MODEL = "checkpoints/latent_gcode/final"
+DIFFUSION_REPO = "twarner/dcode-latent-gcode"
+
+# Text-to-text model (legacy)
 BEST_MODEL = "checkpoints/flan-t5-base_seed42/final"
 MODEL_REPO = "twarner/dcode-flan-t5-base"
 
@@ -178,6 +182,109 @@ Source images: See original Kaggle dataset license.
 """
 
 
+DIFFUSION_CARD = """---
+license: mit
+language:
+- en
+library_name: transformers
+tags:
+- gcode
+- polargraph
+- pen-plotter
+- text-to-gcode
+- diffusion
+- latent
+datasets:
+- twarner/dcode-polargraph-gcode
+pipeline_tag: text-generation
+---
+
+# dcode-latent-gcode
+
+Latent-to-gcode transformer model for generating polargraph-compatible gcode from Stable Diffusion latents.
+
+## Model Description
+
+This model takes latent representations from Stable Diffusion and decodes them to gcode for polargraph pen plotters. Combined with SD's text-to-latent pipeline, it enables text-to-gcode generation.
+
+## Architecture
+
+- **Latent Projector**: Projects SD latents (4x64x64) to transformer hidden space
+- **Transformer Decoder**: 6-layer, 8-head, 512-dim decoder for gcode generation
+- **Max sequence length**: 1024 tokens
+
+## Usage
+
+```python
+from diffusers import StableDiffusionPipeline
+import torch
+
+# Load SD for text-to-latent
+sd = StableDiffusionPipeline.from_pretrained("stabilityai/stable-diffusion-2-1-base")
+
+# Load gcode decoder
+from dcode.diffusion import LatentGcodeModel
+model = LatentGcodeModel.from_pretrained("twarner/dcode-latent-gcode")
+
+# Generate
+prompt = "drawing of a cat"
+latent = sd(prompt, output_type="latent").images
+gcode = model.generate(latent)
+```
+
+## Training
+
+- **Dataset**: 175,952 image-gcode pairs with BLIP captions
+- **Epochs**: 10
+- **Final loss**: 0.107
+- **Hardware**: NVIDIA H100 (80GB)
+- **Training time**: ~2 hours
+
+## Machine Limits
+
+Generated gcode is validated for polargraph bounds:
+- X: -420.5 to 420.5 mm
+- Y: -594.5 to 594.5 mm
+- Pen up: 90 deg, Pen down: 40 deg
+
+## License
+
+MIT
+
+## Citation
+
+```bibtex
+@misc{dcode2025,
+  author = {Teddy Warner},
+  title = {dcode: Text to Polargraph Gcode via Latent Diffusion},
+  year = {2025},
+  url = {https://github.com/Twarner491/dcode}
+}
+```
+"""
+
+
+def upload_diffusion_model():
+    """Upload diffusion model to HuggingFace."""
+    print(f"Uploading diffusion model to {DIFFUSION_REPO}...")
+    
+    # Create repo
+    create_repo(DIFFUSION_REPO, exist_ok=True, repo_type="model")
+    
+    # Write model card
+    model_path = Path(DIFFUSION_MODEL)
+    readme_path = model_path / "README.md"
+    readme_path.write_text(DIFFUSION_CARD, encoding="utf-8")
+    
+    # Upload all files
+    api.upload_folder(
+        folder_path=str(model_path),
+        repo_id=DIFFUSION_REPO,
+        repo_type="model",
+    )
+    print(f"Diffusion model uploaded: https://huggingface.co/{DIFFUSION_REPO}")
+
+
 def upload_model():
     """Upload best model to HuggingFace."""
     print(f"Uploading model to {MODEL_REPO}...")
@@ -257,8 +364,13 @@ if __name__ == "__main__":
     if len(sys.argv) > 1:
         if sys.argv[1] == "model":
             upload_model()
+        elif sys.argv[1] == "diffusion":
+            upload_diffusion_model()
         elif sys.argv[1] == "dataset":
             upload_dataset()
+        elif sys.argv[1] == "all":
+            upload_diffusion_model()
+            upload_model()
+            upload_dataset()
     else:
-        upload_model()
-        upload_dataset()
+        upload_diffusion_model()  # Default to new model
