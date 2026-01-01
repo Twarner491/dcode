@@ -250,5 +250,37 @@ def infer_sd_gcode(prompt: str, model: Path, output: Path | None, temperature: f
         click.echo(gcode)
 
 
+@main.command("train-sd-gcode-v2")
+@click.option("--manifest", "-m", required=True, type=Path)
+@click.option("--output", "-o", default="checkpoints/sd_gcode_v2", type=Path)
+@click.option("--sd-model", default="runwayml/stable-diffusion-v1-5")
+@click.option("--epochs", "-e", default=10, type=int)
+@click.option("--batch-size", "-b", default=8, type=int)
+@click.option("--grad-accum", default=4, type=int)
+@click.option("--lr", default=1e-4, type=float)
+@click.option("--max-len", default=1024, type=int)
+def train_sd_gcode_v2(
+    manifest: Path, output: Path, sd_model: str, epochs: int,
+    batch_size: int, grad_accum: int, lr: float, max_len: int
+):
+    """Train decoder on VAE-encoded image latents (CORRECT approach).
+    
+    Uses deterministic image→latent encoding instead of random diffusion.
+    """
+    from .train_sd_gcode_v2 import train
+
+    result = train(
+        manifest_path=str(manifest),
+        output_dir=str(output),
+        sd_model_id=sd_model,
+        epochs=epochs,
+        batch_size=batch_size,
+        gradient_accumulation=grad_accum,
+        learning_rate=lr,
+        max_gcode_len=max_len,
+    )
+    click.echo(f"Saved: {result}")
+
+
 if __name__ == "__main__":
     main()
