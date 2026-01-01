@@ -1,9 +1,17 @@
 """Corrected SD-Gcode training.
 
-Key fix: Use VAE-encoded IMAGE latents during training (deterministic),
-not random diffusion latents. This creates a meaningful mapping.
+Architecture:
+- SD (frozen): text → text_encoder → UNet → latent
+- Decoder (trained): latent → gcode
 
-At inference: text → SD diffusion → latent → trained decoder → gcode
+Training:
+- Use VAE-encoded IMAGE latents (deterministic)
+- NOT random diffusion latents
+
+Inference:
+- text → frozen SD → latent → trained decoder → gcode
+
+Output: Single model file containing all weights.
 """
 
 import json
@@ -13,7 +21,6 @@ from pathlib import Path
 from tqdm import tqdm
 from transformers import AutoTokenizer
 from diffusers import StableDiffusionPipeline, AutoencoderKL
-from diffusers import DDPMScheduler
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 import torchvision.transforms as T
@@ -93,29 +100,35 @@ class GcodeDecoder(nn.Module):
 class ImageGcodeDataset(Dataset):
     """Dataset that loads images, encodes to latent, and pairs with gcode."""
     
-    def __init__(self, manifest_path: Path, vae: AutoencoderKL, tokenizer, max_gcode_len: int = 1024, device: str = "cuda"):
+    def __init__(self, manifest_path: Path, vae: AutoencoderKL, tokenizer, max_gcode_len: int = 1024):
         self.tokenizer = tokenizer
         self.max_gcode_len = max_gcode_len
-        self.device = device
         self.vae = vae
         
-        # Image transform (512x512 for SD)
+        # Image transform (512x512 for SD VAE)
         self.transform = T.Compose([
             T.Resize((512, 512)),
             T.ToTensor(),
             T.Normalize([0.5], [0.5]),  # [-1, 1]
         ])
         
-        # Load manifest
+        # Load manifest - handle both formats
         with open(manifest_path) as f:
             manifest = json.load(f)
         
-        base_path = manifest_path.parent
-        self.samples = []
+        # Get pairs list (manifest.json has {"pairs": [...]}, captioned.json might be same or list)
+        if isinstance(manifest, list):
+            pairs = manifest
+        elif "pairs" in manifest:
+            pairs = manifest["pairs"]
+        else:
+            pairs = list(manifest.values())[0] if manifest else []
         
-        for item in manifest:
-            img_path = base_path / item["image"]
-            gcode_path = base_path / item["gcode"]
+        self.samples = []
+        for item in pairs:
+            # Paths in manifest are ABSOLUTE
+            img_path = Path(item["image"])
+            gcode_path = Path(item["gcode"])
             
             if img_path.exists() and gcode_path.exists():
                 self.samples.append({
@@ -124,7 +137,7 @@ class ImageGcodeDataset(Dataset):
                     "caption": item.get("caption", ""),
                 })
         
-        print(f"Loaded {len(self.samples)} samples")
+        print(f"Loaded {len(self.samples)} valid samples from {len(pairs)} total")
     
     def __len__(self):
         return len(self.samples)
@@ -133,16 +146,29 @@ class ImageGcodeDataset(Dataset):
         sample = self.samples[idx]
         
         # Load and encode image to latent
-        img = Image.open(sample["image"]).convert("RGB")
+        try:
+            img = Image.open(sample["image"]).convert("RGB")
+        except Exception as e:
+            print(f"Failed to load {sample['image']}: {e}")
+            # Return zeros as fallback
+            return {
+                "latent": torch.zeros(4, 64, 64),
+                "gcode_ids": torch.zeros(self.max_gcode_len, dtype=torch.long),
+            }
+        
         img_tensor = self.transform(img).unsqueeze(0)
         
-        # VAE encode (on CPU, move for encoding)
+        # VAE encode
         with torch.no_grad():
-            latent = self.vae.encode(img_tensor.to(self.vae.device)).latent_dist.sample()
+            latent = self.vae.encode(img_tensor.to(self.vae.device, self.vae.dtype)).latent_dist.sample()
             latent = latent * self.vae.config.scaling_factor
         
         # Load and tokenize gcode
-        gcode = sample["gcode"].read_text(errors="ignore")[:50000]  # Truncate long files
+        try:
+            gcode = sample["gcode"].read_text(errors="ignore")[:50000]
+        except Exception:
+            gcode = "; empty"
+        
         tokens = self.tokenizer.encode(
             gcode,
             max_length=self.max_gcode_len,
@@ -169,27 +195,29 @@ def train(
 ):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Training on {device}")
+    print(f"Batch size: {batch_size}, Grad accum: {gradient_accumulation}, Effective: {batch_size * gradient_accumulation}")
     
-    # Load VAE for encoding images
+    # Load VAE for encoding images (this is the ONLY SD component we need for training)
     print(f"Loading VAE from {sd_model_id}...")
     vae = AutoencoderKL.from_pretrained(sd_model_id, subfolder="vae", torch_dtype=torch.float16)
     vae = vae.to(device)
     vae.eval()
+    vae.requires_grad_(False)  # Freeze VAE
     
-    # Tokenizer
+    # Tokenizer for gcode
     tokenizer = AutoTokenizer.from_pretrained("google/flan-t5-base")
     
     # Dataset
+    print(f"Loading dataset from {manifest_path}...")
     dataset = ImageGcodeDataset(
         Path(manifest_path),
         vae,
         tokenizer,
         max_gcode_len=max_gcode_len,
-        device=device,
     )
     
-    # Free VAE memory after pre-encoding (or keep for online encoding)
-    # For memory efficiency, we'll encode on-the-fly in smaller batches
+    if len(dataset) == 0:
+        raise ValueError("No valid samples found in dataset!")
     
     dataloader = DataLoader(
         dataset,
@@ -197,16 +225,21 @@ def train(
         shuffle=True,
         num_workers=4,
         pin_memory=True,
+        drop_last=True,
     )
     
-    # Create decoder
+    # Create decoder (this is what we train)
     config = GcodeDecoderConfig(
         vocab_size=tokenizer.vocab_size,
         max_seq_len=max_gcode_len,
     )
     decoder = GcodeDecoder(config).to(device)
+    decoder.train()
     
-    # Optimizer
+    num_params = sum(p.numel() for p in decoder.parameters())
+    print(f"Decoder params: {num_params:,} ({num_params/1e6:.1f}M)")
+    
+    # Optimizer - ONLY decoder (SD is frozen)
     optimizer = torch.optim.AdamW(decoder.parameters(), lr=learning_rate)
     
     # Training loop
@@ -214,6 +247,8 @@ def train(
     output_path.mkdir(parents=True, exist_ok=True)
     
     global_step = 0
+    best_loss = float('inf')
+    
     for epoch in range(epochs):
         decoder.train()
         epoch_loss = 0
@@ -222,6 +257,10 @@ def train(
         for batch_idx, batch in enumerate(pbar):
             latent = batch["latent"].to(device, dtype=torch.float16)
             gcode_ids = batch["gcode_ids"].to(device)
+            
+            # Skip empty batches
+            if latent.abs().sum() == 0:
+                continue
             
             # Teacher forcing
             decoder_input = gcode_ids[:, :-1]
@@ -246,7 +285,7 @@ def train(
                 global_step += 1
             
             epoch_loss += loss.item() * gradient_accumulation
-            pbar.set_postfix(loss=f"{loss.item() * gradient_accumulation:.4f}")
+            pbar.set_postfix(loss=f"{loss.item() * gradient_accumulation:.4f}", step=global_step)
             
             # Save checkpoint
             if global_step % 1000 == 0 and global_step > 0:
@@ -257,33 +296,44 @@ def train(
         
         avg_loss = epoch_loss / len(dataloader)
         print(f"Epoch {epoch+1} avg loss: {avg_loss:.4f}")
+        
+        if avg_loss < best_loss:
+            best_loss = avg_loss
     
-    # Save final - COMPLETE model (SD + decoder) as single checkpoint
+    # Free VAE memory
+    del vae
+    torch.cuda.empty_cache()
+    
+    # Save final - COMPLETE model (SD + trained decoder) as single checkpoint
     final_path = output_path / "final"
     final_path.mkdir(exist_ok=True)
     
-    # Load full SD pipeline for saving
-    print("Packaging complete model (SD + decoder)...")
+    print("Packaging complete model (SD + trained decoder)...")
+    
+    # Load full SD pipeline for saving (pretrained weights since SD is frozen)
     pipe = StableDiffusionPipeline.from_pretrained(sd_model_id, torch_dtype=torch.float16)
     
     # Build complete state dict with all weights
     complete_state = {}
     
-    # Add SD text encoder weights
+    # Add SD text encoder weights (pretrained, frozen)
     for name, param in pipe.text_encoder.named_parameters():
         complete_state[f"text_encoder.{name}"] = param.data.cpu()
+    print(f"Added {sum(1 for k in complete_state if k.startswith('text_encoder'))} text_encoder weights")
     
-    # Add SD UNet weights
+    # Add SD UNet weights (pretrained, frozen)
     for name, param in pipe.unet.named_parameters():
         complete_state[f"unet.{name}"] = param.data.cpu()
+    print(f"Added {sum(1 for k in complete_state if k.startswith('unet'))} UNet weights")
     
-    # Add trained decoder weights
+    # Add TRAINED decoder weights
     for name, param in decoder.named_parameters():
         complete_state[f"gcode_decoder.{name}"] = param.data.cpu()
+    print(f"Added {sum(1 for k in complete_state if k.startswith('gcode_decoder'))} decoder weights (TRAINED)")
     
     # Save complete model
     torch.save(complete_state, final_path / "pytorch_model.bin")
-    print(f"Saved {len(complete_state)} weight tensors")
+    print(f"Saved {len(complete_state)} total weight tensors")
     
     # Save config
     with open(final_path / "config.json", "w") as f:
@@ -308,8 +358,13 @@ def train(
     del pipe
     torch.cuda.empty_cache()
     
-    print(f"\nTraining complete! Single model saved to {final_path}")
-    print(f"Contains: text_encoder + unet + gcode_decoder")
+    print(f"\n{'='*50}")
+    print(f"Training complete!")
+    print(f"Best loss: {best_loss:.4f}")
+    print(f"Model saved to: {final_path}")
+    print(f"Contains: frozen SD (text_encoder + UNet) + trained gcode_decoder")
+    print(f"{'='*50}")
+    
     return str(final_path)
 
 
