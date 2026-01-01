@@ -97,90 +97,128 @@ class GcodeDecoder(nn.Module):
         return self.lm_head(x)
 
 
-class ImageGcodeDataset(Dataset):
-    """Dataset that loads images, encodes to latent, and pairs with gcode."""
+class PreEncodedDataset(Dataset):
+    """Dataset with pre-encoded latents for fast training."""
     
-    def __init__(self, manifest_path: Path, vae: AutoencoderKL, tokenizer, max_gcode_len: int = 1024):
-        self.tokenizer = tokenizer
-        self.max_gcode_len = max_gcode_len
-        self.vae = vae
-        
-        # Image transform (512x512 for SD VAE)
-        self.transform = T.Compose([
-            T.Resize((512, 512)),
-            T.ToTensor(),
-            T.Normalize([0.5], [0.5]),  # [-1, 1]
-        ])
-        
-        # Load manifest - handle both formats
-        with open(manifest_path) as f:
-            manifest = json.load(f)
-        
-        # Get pairs list (manifest.json has {"pairs": [...]}, captioned.json might be same or list)
-        if isinstance(manifest, list):
-            pairs = manifest
-        elif "pairs" in manifest:
-            pairs = manifest["pairs"]
-        else:
-            pairs = list(manifest.values())[0] if manifest else []
-        
-        self.samples = []
-        for item in pairs:
-            # Paths in manifest are ABSOLUTE
-            img_path = Path(item["image"])
-            gcode_path = Path(item["gcode"])
-            
-            if img_path.exists() and gcode_path.exists():
-                self.samples.append({
-                    "image": img_path,
-                    "gcode": gcode_path,
-                    "caption": item.get("caption", ""),
-                })
-        
-        print(f"Loaded {len(self.samples)} valid samples from {len(pairs)} total")
+    def __init__(self, latents: torch.Tensor, gcode_ids: torch.Tensor):
+        self.latents = latents
+        self.gcode_ids = gcode_ids
     
     def __len__(self):
-        return len(self.samples)
+        return len(self.latents)
     
     def __getitem__(self, idx):
-        sample = self.samples[idx]
-        
-        # Load and encode image to latent
-        try:
-            img = Image.open(sample["image"]).convert("RGB")
-        except Exception as e:
-            print(f"Failed to load {sample['image']}: {e}")
-            # Return zeros as fallback
-            return {
-                "latent": torch.zeros(4, 64, 64),
-                "gcode_ids": torch.zeros(self.max_gcode_len, dtype=torch.long),
-            }
-        
-        img_tensor = self.transform(img).unsqueeze(0)
-        
-        # VAE encode
-        with torch.no_grad():
-            latent = self.vae.encode(img_tensor.to(self.vae.device, self.vae.dtype)).latent_dist.sample()
-            latent = latent * self.vae.config.scaling_factor
-        
-        # Load and tokenize gcode
-        try:
-            gcode = sample["gcode"].read_text(errors="ignore")[:50000]
-        except Exception:
-            gcode = "; empty"
-        
-        tokens = self.tokenizer.encode(
-            gcode,
-            max_length=self.max_gcode_len,
-            truncation=True,
-            padding="max_length",
-            return_tensors="pt",
-        ).squeeze(0)
-        
         return {
-            "latent": latent.squeeze(0).cpu(),  # [4, 64, 64]
-            "gcode_ids": tokens,
+            "latent": self.latents[idx],
+            "gcode_ids": self.gcode_ids[idx],
         }
+
+
+def pre_encode_dataset(
+    manifest_path: Path,
+    vae: AutoencoderKL,
+    tokenizer,
+    max_gcode_len: int,
+    cache_dir: Path,
+    batch_size: int = 64,
+):
+    """Pre-encode all images to latents and tokenize gcode. Cache to disk."""
+    cache_file = cache_dir / "latents_v2.pt"
+    
+    if cache_file.exists():
+        print(f"Loading cached latents from {cache_file}...")
+        data = torch.load(cache_file)
+        return PreEncodedDataset(data["latents"], data["gcode_ids"])
+    
+    print("Pre-encoding dataset (one-time)...")
+    
+    # Load manifest
+    with open(manifest_path) as f:
+        manifest = json.load(f)
+    
+    if isinstance(manifest, list):
+        pairs = manifest
+    elif "pairs" in manifest:
+        pairs = manifest["pairs"]
+    else:
+        pairs = list(manifest.values())[0] if manifest else []
+    
+    # Filter valid samples
+    samples = []
+    for item in pairs:
+        img_path = Path(item["image"])
+        gcode_path = Path(item["gcode"])
+        if img_path.exists() and gcode_path.exists():
+            samples.append({"image": img_path, "gcode": gcode_path})
+    
+    print(f"Found {len(samples)} valid samples")
+    
+    transform = T.Compose([
+        T.Resize((512, 512)),
+        T.ToTensor(),
+        T.Normalize([0.5], [0.5]),
+    ])
+    
+    all_latents = []
+    all_gcode_ids = []
+    
+    # Process in batches for GPU efficiency
+    for i in tqdm(range(0, len(samples), batch_size), desc="Encoding"):
+        batch_samples = samples[i:i+batch_size]
+        
+        # Load images
+        images = []
+        valid_indices = []
+        for j, sample in enumerate(batch_samples):
+            try:
+                img = Image.open(sample["image"]).convert("RGB")
+                img_tensor = transform(img)
+                images.append(img_tensor)
+                valid_indices.append(j)
+            except Exception:
+                continue
+        
+        if not images:
+            continue
+        
+        # Batch encode
+        img_batch = torch.stack(images).to(vae.device, vae.dtype)
+        with torch.no_grad():
+            latents = vae.encode(img_batch).latent_dist.sample()
+            latents = latents * vae.config.scaling_factor
+        
+        # Tokenize gcode for valid samples
+        for k, j in enumerate(valid_indices):
+            sample = batch_samples[j]
+            try:
+                gcode = sample["gcode"].read_text(errors="ignore")[:50000]
+            except Exception:
+                gcode = "; empty"
+            
+            tokens = tokenizer.encode(
+                gcode,
+                max_length=max_gcode_len,
+                truncation=True,
+                padding="max_length",
+                return_tensors="pt",
+            ).squeeze(0)
+            
+            all_latents.append(latents[k].cpu())
+            all_gcode_ids.append(tokens)
+    
+    # Stack
+    all_latents = torch.stack(all_latents)
+    all_gcode_ids = torch.stack(all_gcode_ids)
+    
+    print(f"Encoded {len(all_latents)} samples")
+    print(f"Latents: {all_latents.shape}, Gcode: {all_gcode_ids.shape}")
+    
+    # Cache
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    torch.save({"latents": all_latents, "gcode_ids": all_gcode_ids}, cache_file)
+    print(f"Cached to {cache_file}")
+    
+    return PreEncodedDataset(all_latents, all_gcode_ids)
 
 
 def train(
@@ -207,25 +245,33 @@ def train(
     # Tokenizer for gcode
     tokenizer = AutoTokenizer.from_pretrained("google/flan-t5-base")
     
-    # Dataset
-    print(f"Loading dataset from {manifest_path}...")
-    dataset = ImageGcodeDataset(
+    # Pre-encode dataset (fast training)
+    cache_dir = Path(output_dir) / "cache"
+    dataset = pre_encode_dataset(
         Path(manifest_path),
         vae,
         tokenizer,
-        max_gcode_len=max_gcode_len,
+        max_gcode_len,
+        cache_dir,
+        batch_size=64,  # Batch encode for speed
     )
     
     if len(dataset) == 0:
         raise ValueError("No valid samples found in dataset!")
     
+    # Free VAE memory after encoding
+    del vae
+    torch.cuda.empty_cache()
+    print("Freed VAE memory")
+    
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=0,  # CUDA doesn't work with forked workers
+        num_workers=4,  # Safe now - no CUDA in workers
         pin_memory=True,
         drop_last=True,
+        persistent_workers=True,
     )
     
     # Create decoder (this is what we train)
@@ -299,10 +345,6 @@ def train(
         
         if avg_loss < best_loss:
             best_loss = avg_loss
-    
-    # Free VAE memory
-    del vae
-    torch.cuda.empty_cache()
     
     # Save final - COMPLETE model (SD + trained decoder) as single checkpoint
     final_path = output_path / "final"
