@@ -114,29 +114,39 @@ class PreEncodedDataset(Dataset):
         }
 
 
-def _load_and_transform(args):
-    """Load image and read gcode (I/O bound, parallel)."""
-    sample, transform = args
-    try:
-        img = Image.open(sample["image"]).convert("RGB")
-        img_tensor = transform(img)
-        gcode = sample["gcode"].read_text(errors="ignore")[:20000]
-        return img_tensor, gcode, True
-    except Exception:
-        return None, None, False
-
-
-def _tokenize(args):
-    """Tokenize gcode (CPU bound, parallel)."""
-    gcode, tokenizer, max_len = args
-    tokens = tokenizer.encode(
-        gcode,
-        max_length=max_len,
-        truncation=True,
-        padding="max_length",
-        return_tensors="pt",
-    ).squeeze(0)
-    return tokens
+class ImageGcodeLoaderDataset(Dataset):
+    """Dataset for parallel loading with DataLoader workers (CPU)."""
+    
+    def __init__(self, samples, transform, tokenizer, max_gcode_len):
+        self.samples = samples
+        self.transform = transform
+        self.tokenizer = tokenizer
+        self.max_gcode_len = max_gcode_len
+    
+    def __len__(self):
+        return len(self.samples)
+    
+    def __getitem__(self, idx):
+        sample = self.samples[idx]
+        try:
+            # Load image
+            img = Image.open(sample["image"]).convert("RGB")
+            img_tensor = self.transform(img)
+            
+            # Load and tokenize gcode
+            gcode = sample["gcode"].read_text(errors="ignore")[:20000]
+            tokens = self.tokenizer.encode(
+                gcode,
+                max_length=self.max_gcode_len,
+                truncation=True,
+                padding="max_length",
+                return_tensors="pt",
+            ).squeeze(0)
+            
+            return img_tensor, tokens, True
+        except Exception:
+            # Return zeros for failed samples
+            return torch.zeros(3, 512, 512), torch.zeros(self.max_gcode_len, dtype=torch.long), False
 
 
 def pre_encode_dataset(
@@ -145,12 +155,10 @@ def pre_encode_dataset(
     tokenizer,
     max_gcode_len: int,
     cache_dir: Path,
-    batch_size: int = 256,
-    num_workers: int = 64,
+    encode_batch_size: int = 64,  # Smaller for VAE OOM
+    num_workers: int = 16,  # CPU workers for DataLoader
 ):
-    """Pre-encode all images to latents and tokenize gcode. Cache to disk."""
-    from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
-    import multiprocessing as mp
+    """Pre-encode all images to latents using DataLoader workers."""
     
     cache_file = cache_dir / "latents_v2.pt"
     
@@ -159,7 +167,7 @@ def pre_encode_dataset(
         data = torch.load(cache_file)
         return PreEncodedDataset(data["latents"], data["gcode_ids"])
     
-    print("Pre-encoding dataset (one-time, fully parallel)...")
+    print("Pre-encoding dataset with DataLoader workers...")
     
     # Load manifest
     with open(manifest_path) as f:
@@ -181,7 +189,7 @@ def pre_encode_dataset(
             samples.append({"image": img_path, "gcode": gcode_path})
     
     print(f"Found {len(samples)} valid samples")
-    print(f"Using {num_workers} I/O workers, batch size {batch_size}")
+    print(f"Using {num_workers} CPU workers, encode batch {encode_batch_size}")
     
     transform = T.Compose([
         T.Resize((512, 512)),
@@ -189,69 +197,41 @@ def pre_encode_dataset(
         T.Normalize([0.5], [0.5]),
     ])
     
+    # Create dataset and dataloader for parallel CPU loading
+    loader_dataset = ImageGcodeLoaderDataset(samples, transform, tokenizer, max_gcode_len)
+    loader = DataLoader(
+        loader_dataset,
+        batch_size=encode_batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+        prefetch_factor=4,
+        persistent_workers=True,
+    )
+    
     all_latents = []
     all_gcode_ids = []
     
-    # Use thread pool for I/O (loading images/gcode from disk)
-    io_executor = ThreadPoolExecutor(max_workers=num_workers)
-    
-    # Pre-submit next batch while current batch encodes
-    pending_batch = None
-    batch_iter = range(0, len(samples), batch_size)
-    
-    for i in tqdm(batch_iter, desc="Encoding"):
-        batch_samples = samples[i:i+batch_size]
-        
-        # If we have a pending batch from prefetch, use it
-        if pending_batch is not None:
-            images, gcodes = pending_batch
-            pending_batch = None
-        else:
-            # Load this batch
-            args = [(s, transform) for s in batch_samples]
-            results = list(io_executor.map(_load_and_transform, args))
-            images = [r[0] for r in results if r[2]]
-            gcodes = [r[1] for r in results if r[2]]
-        
-        if not images:
+    for img_batch, token_batch, valid_batch in tqdm(loader, desc="Encoding"):
+        # Filter valid samples
+        valid_mask = valid_batch.bool()
+        if not valid_mask.any():
             continue
         
-        # Start loading next batch in background
-        next_i = i + batch_size
-        if next_i < len(samples):
-            next_batch = samples[next_i:next_i+batch_size]
-            next_args = [(s, transform) for s in next_batch]
-            future_results = io_executor.map(_load_and_transform, next_args)
+        imgs = img_batch[valid_mask].to(vae.device, vae.dtype, non_blocking=True)
+        tokens = token_batch[valid_mask]
         
-        # Encode current batch on GPU
-        img_batch = torch.stack(images).to(vae.device, vae.dtype)
+        # Encode on GPU
         with torch.no_grad():
-            latents = vae.encode(img_batch).latent_dist.sample()
+            latents = vae.encode(imgs).latent_dist.sample()
             latents = latents * vae.config.scaling_factor
-            latents_cpu = latents.cpu()
         
-        # Tokenize in parallel (use threads since tokenizer releases GIL)
-        token_args = [(g, tokenizer, max_gcode_len) for g in gcodes]
-        tokens_list = list(io_executor.map(_tokenize, token_args))
-        
-        # Collect results
-        for k in range(len(gcodes)):
-            all_latents.append(latents_cpu[k])
-            all_gcode_ids.append(tokens_list[k])
-        
-        # Get prefetched next batch
-        if next_i < len(samples):
-            next_results = list(future_results)
-            pending_batch = (
-                [r[0] for r in next_results if r[2]],
-                [r[1] for r in next_results if r[2]]
-            )
-    
-    io_executor.shutdown()
+        all_latents.append(latents.cpu())
+        all_gcode_ids.append(tokens)
     
     # Stack
-    all_latents = torch.stack(all_latents)
-    all_gcode_ids = torch.stack(all_gcode_ids)
+    all_latents = torch.cat(all_latents, dim=0)
+    all_gcode_ids = torch.cat(all_gcode_ids, dim=0)
     
     print(f"Encoded {len(all_latents)} samples")
     print(f"Latents: {all_latents.shape}, Gcode: {all_gcode_ids.shape}")
@@ -296,8 +276,8 @@ def train(
         tokenizer,
         max_gcode_len,
         cache_dir,
-        batch_size=256,  # Large batches for GPU
-        num_workers=64,  # Parallel I/O
+        encode_batch_size=64,  # Safe for VAE memory
+        num_workers=16,  # CPU workers for I/O
     )
     
     if len(dataset) == 0:
