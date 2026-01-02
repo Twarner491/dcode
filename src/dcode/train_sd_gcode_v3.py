@@ -364,17 +364,33 @@ def pre_encode_dataset_v3(
 ) -> AlignedLatentDataset:
     """Pre-encode images (and optionally text) to latents."""
     
-    cache_file = cache_dir / f"latents_v3_rank{rank}.pt"
+    # All ranks use the same cache file (rank 0 creates it)
+    cache_file = cache_dir / "latents_v3.pt"
+    
+    # Non-rank-0 processes wait for cache file to exist
+    if rank != 0:
+        import time
+        max_wait = 7200  # 2 hours max wait
+        waited = 0
+        while not cache_file.exists() and waited < max_wait:
+            time.sleep(10)
+            waited += 10
+        if not cache_file.exists():
+            raise RuntimeError(f"Cache file not created by rank 0 after {max_wait}s")
     
     if cache_file.exists():
         if rank == 0:
             print(f"Loading cached data from {cache_file}")
-        data = torch.load(cache_file)
+        data = torch.load(cache_file, weights_only=False)
         return AlignedLatentDataset(
             data["image_latents"],
             data.get("text_latents"),
             data["gcode_ids"],
         )
+    
+    # Only rank 0 creates the cache
+    if rank != 0:
+        raise RuntimeError("Non-rank-0 should have loaded from cache")
     
     if rank == 0:
         print("Pre-encoding dataset...")
@@ -505,13 +521,14 @@ def pre_encode_dataset_v3(
             print(f"Text latents: {all_text_latents.shape}")
         print(f"Gcode tokens: {all_gcode_ids.shape}")
     
-    # Cache
+    # Cache (only rank 0 saves)
     cache_dir.mkdir(parents=True, exist_ok=True)
     torch.save({
         "image_latents": all_image_latents,
         "text_latents": all_text_latents,
         "gcode_ids": all_gcode_ids,
     }, cache_file)
+    print(f"Cached to {cache_file}")
     
     return AlignedLatentDataset(all_image_latents, all_text_latents, all_gcode_ids)
 
@@ -656,38 +673,24 @@ def train(
     if rank != 0:
         tokenizer = build_gcode_tokenizer(gcode_files, cache_dir, vocab_size=8192)  # Load cached
     
-    # ========== Pre-encode dataset (only rank 0, others load from cache) ==========
-    if rank == 0:
-        dataset = pre_encode_dataset_v3(
-            Path(manifest_path),
-            vae,
-            sd_pipe,
-            tokenizer,
-            max_gcode_len,
-            cache_dir,
-            batch_size=64,  # Safe batch for H100
-            num_workers=16,  # Conservative threads
-            generate_text_latents=generate_text_latents,
-            rank=rank,
-        )
+    # ========== Pre-encode dataset ==========
+    # All ranks call this - rank 0 encodes, others load from cache
+    dataset = pre_encode_dataset_v3(
+        Path(manifest_path),
+        vae,
+        sd_pipe,
+        tokenizer,
+        max_gcode_len,
+        cache_dir,
+        batch_size=64,
+        num_workers=8,  # Conservative
+        generate_text_latents=generate_text_latents,
+        rank=rank,
+    )
     
+    # Sync after encoding
     if use_ddp:
-        dist.barrier()  # Wait for rank 0 to finish encoding
-    
-    if rank != 0:
-        # Other ranks just load the cached data
-        dataset = pre_encode_dataset_v3(
-            Path(manifest_path),
-            vae,
-            sd_pipe,
-            tokenizer,
-            max_gcode_len,
-            cache_dir,
-            batch_size=64,
-            num_workers=16,
-            generate_text_latents=generate_text_latents,
-            rank=rank,
-        )
+        dist.barrier()
     
     # Free memory
     del vae
