@@ -357,8 +357,8 @@ def pre_encode_dataset_v3(
     tokenizer: PreTrainedTokenizerFast,
     max_gcode_len: int,
     cache_dir: Path,
-    batch_size: int = 64,  # Larger batch for VAE encoding
-    num_workers: int = 32,  # More CPU workers for I/O
+    batch_size: int = 64,  # Batch for VAE encoding
+    num_workers: int = 16,  # Conservative thread count
     generate_text_latents: bool = True,
     rank: int = 0,  # For DDP
 ) -> AlignedLatentDataset:
@@ -657,7 +657,6 @@ def train(
         tokenizer = build_gcode_tokenizer(gcode_files, cache_dir, vocab_size=8192)  # Load cached
     
     # ========== Pre-encode dataset (only rank 0, others load from cache) ==========
-    # Use larger batch for VAE encoding and more workers for I/O
     if rank == 0:
         dataset = pre_encode_dataset_v3(
             Path(manifest_path),
@@ -666,8 +665,8 @@ def train(
             tokenizer,
             max_gcode_len,
             cache_dir,
-            batch_size=128,  # Large batch for H100
-            num_workers=64,  # Many threads for parallel I/O
+            batch_size=64,  # Safe batch for H100
+            num_workers=16,  # Conservative threads
             generate_text_latents=generate_text_latents,
             rank=rank,
         )
@@ -684,8 +683,8 @@ def train(
             tokenizer,
             max_gcode_len,
             cache_dir,
-            batch_size=128,
-            num_workers=64,
+            batch_size=64,
+            num_workers=16,
             generate_text_latents=generate_text_latents,
             rank=rank,
         )
