@@ -473,18 +473,21 @@ def pre_encode_dataset_v3(
                 text_latents = text_results.images
             all_text_latents.append(text_latents.cpu())
         
-        # Tokenize gcode
-        for gcode in gcodes:
-            # Replace newlines with special token marker
+        # Tokenize gcode in parallel
+        def tokenize_gcode(gcode):
             gcode_clean = gcode.replace("\n", " <newline> ")
-            tokens = tokenizer.encode(
+            return tokenizer.encode(
                 gcode_clean,
                 max_length=max_gcode_len,
                 truncation=True,
                 padding="max_length",
                 return_tensors="pt",
             ).squeeze(0)
-            all_gcode_ids.append(tokens)
+        
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            tokens_list = list(executor.map(tokenize_gcode, gcodes))
+        
+        all_gcode_ids.extend(tokens_list)
     
     # Stack all
     all_image_latents = torch.cat(all_image_latents, dim=0)
