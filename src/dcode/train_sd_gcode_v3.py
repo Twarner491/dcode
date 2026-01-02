@@ -344,8 +344,8 @@ def pre_encode_dataset_v3(
     tokenizer: PreTrainedTokenizerFast,
     max_gcode_len: int,
     cache_dir: Path,
-    batch_size: int = 32,
-    num_workers: int = 8,
+    batch_size: int = 64,  # Larger batch for VAE encoding
+    num_workers: int = 32,  # More CPU workers for I/O
     generate_text_latents: bool = True,
     rank: int = 0,  # For DDP
 ) -> AlignedLatentDataset:
@@ -400,32 +400,40 @@ def pre_encode_dataset_v3(
     all_text_latents = []
     all_gcode_ids = []
     
-    # Process in batches
+    # Process in batches with parallel I/O
     device = vae.device
     dtype = vae.dtype
+    
+    from concurrent.futures import ThreadPoolExecutor
+    
+    def load_sample(s):
+        """Load single sample (runs in thread pool)."""
+        try:
+            img = Image.open(s["image"]).convert("RGB")
+            img_tensor = transform(img)
+            gcode = s["gcode"].read_text(errors="ignore")[:50000]
+            return img_tensor, gcode, s["caption"], True
+        except Exception:
+            return None, None, None, False
     
     for i in tqdm(range(0, len(samples), batch_size), desc="Encoding", disable=rank != 0):
         batch_samples = samples[i:i + batch_size]
         
-        # Load and encode images
+        # Parallel I/O loading
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            results = list(executor.map(load_sample, batch_samples))
+        
         imgs = []
         gcodes = []
         captions = []
         valid = []
         
-        for s in batch_samples:
-            try:
-                img = Image.open(s["image"]).convert("RGB")
-                img_tensor = transform(img)
-                
-                gcode = s["gcode"].read_text(errors="ignore")[:50000]  # Limit size
-                
+        for img_tensor, gcode, caption, is_valid in results:
+            if is_valid:
                 imgs.append(img_tensor)
                 gcodes.append(gcode)
-                captions.append(s["caption"])
-                valid.append(True)
-            except Exception:
-                valid.append(False)
+                captions.append(caption)
+            valid.append(is_valid)
         
         if not any(valid):
             continue
@@ -617,26 +625,54 @@ def train(
         ).to(device)
         sd_pipe.set_progress_bar_config(disable=True)
     
-    # ========== Build/load custom gcode tokenizer ==========
+    # ========== Build/load custom gcode tokenizer (only on rank 0) ==========
     manifest = json.load(open(manifest_path))
     pairs = manifest.get("pairs", manifest) if isinstance(manifest, dict) else manifest
     gcode_files = [Path(p.get("gcode", "")) for p in pairs if Path(p.get("gcode", "")).exists()]
     
-    tokenizer = build_gcode_tokenizer(gcode_files, cache_dir, vocab_size=8192)
+    # Only rank 0 builds tokenizer, others wait
+    if rank == 0:
+        tokenizer = build_gcode_tokenizer(gcode_files, cache_dir, vocab_size=8192)
     
-    # ========== Pre-encode dataset ==========
-    dataset = pre_encode_dataset_v3(
-        Path(manifest_path),
-        vae,
-        sd_pipe,
-        tokenizer,
-        max_gcode_len,
-        cache_dir,
-        batch_size=32,
-        num_workers=8,
-        generate_text_latents=generate_text_latents,
-        rank=rank,
-    )
+    if use_ddp:
+        dist.barrier()  # Wait for rank 0 to finish
+    
+    if rank != 0:
+        tokenizer = build_gcode_tokenizer(gcode_files, cache_dir, vocab_size=8192)  # Load cached
+    
+    # ========== Pre-encode dataset (only rank 0, others load from cache) ==========
+    # Use larger batch for VAE encoding and more workers for I/O
+    if rank == 0:
+        dataset = pre_encode_dataset_v3(
+            Path(manifest_path),
+            vae,
+            sd_pipe,
+            tokenizer,
+            max_gcode_len,
+            cache_dir,
+            batch_size=128,  # Large batch for H100
+            num_workers=64,  # Many threads for parallel I/O
+            generate_text_latents=generate_text_latents,
+            rank=rank,
+        )
+    
+    if use_ddp:
+        dist.barrier()  # Wait for rank 0 to finish encoding
+    
+    if rank != 0:
+        # Other ranks just load the cached data
+        dataset = pre_encode_dataset_v3(
+            Path(manifest_path),
+            vae,
+            sd_pipe,
+            tokenizer,
+            max_gcode_len,
+            cache_dir,
+            batch_size=128,
+            num_workers=64,
+            generate_text_latents=generate_text_latents,
+            rank=rank,
+        )
     
     # Free memory
     del vae
