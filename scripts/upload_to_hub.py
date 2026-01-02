@@ -1,10 +1,13 @@
 """Upload models and dataset to HuggingFace Hub."""
 
+import os
 import json
 from pathlib import Path
 from huggingface_hub import HfApi, create_repo
 
-api = HfApi()
+# Get token from env or hardcode for Lambda
+TOKEN = os.environ.get("HF_TOKEN")
+api = HfApi(token=TOKEN)
 
 # SD-Gcode v2 model (correct training)
 SD_GCODE_MODEL = "checkpoints/sd_gcode_v2/final"
@@ -281,7 +284,7 @@ def upload_sd_gcode():
     print(f"Uploading SD-Gcode model to {SD_GCODE_REPO}...")
     
     # Create repo
-    create_repo(SD_GCODE_REPO, exist_ok=True, repo_type="model")
+    create_repo(SD_GCODE_REPO, exist_ok=True, repo_type="model", token=TOKEN)
     
     # Write model card
     model_path = Path(SD_GCODE_MODEL)
@@ -293,6 +296,7 @@ def upload_sd_gcode():
         folder_path=str(model_path),
         repo_id=SD_GCODE_REPO,
         repo_type="model",
+        token=TOKEN,
     )
     print(f"SD-Gcode model uploaded: https://huggingface.co/{SD_GCODE_REPO}")
 
