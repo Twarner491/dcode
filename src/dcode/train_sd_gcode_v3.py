@@ -64,7 +64,16 @@ def build_gcode_tokenizer(gcode_files: list[Path], save_path: Path, vocab_size: 
     
     if tokenizer_path.exists():
         print(f"Loading cached gcode tokenizer from {tokenizer_path}")
-        return PreTrainedTokenizerFast(tokenizer_file=str(tokenizer_path))
+        hf_tokenizer = PreTrainedTokenizerFast(
+            tokenizer_file=str(tokenizer_path),
+            pad_token="<pad>",
+            unk_token="<unk>",
+            bos_token="<s>",
+            eos_token="</s>",
+        )
+        hf_tokenizer.pad_token = "<pad>"
+        hf_tokenizer.pad_token_id = hf_tokenizer.convert_tokens_to_ids("<pad>")
+        return hf_tokenizer
     
     print(f"Building custom gcode tokenizer from {len(gcode_files)} files...")
     
@@ -109,6 +118,10 @@ def build_gcode_tokenizer(gcode_files: list[Path], save_path: Path, vocab_size: 
         bos_token="<s>",
         eos_token="</s>",
     )
+    
+    # Ensure special tokens are properly set
+    hf_tokenizer.pad_token = "<pad>"
+    hf_tokenizer.pad_token_id = hf_tokenizer.convert_tokens_to_ids("<pad>")
     
     # Add newline token
     hf_tokenizer.add_tokens(["<newline>"])
