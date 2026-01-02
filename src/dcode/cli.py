@@ -282,5 +282,54 @@ def train_sd_gcode_v2(
     click.echo(f"Saved: {result}")
 
 
+@main.command("train-sd-gcode-v3")
+@click.option("--manifest", "-m", required=True, type=Path)
+@click.option("--output", "-o", default="checkpoints/sd_gcode_v3", type=Path)
+@click.option("--sd-model", default="runwayml/stable-diffusion-v1-5")
+@click.option("--epochs", "-e", default=20, type=int, help="More epochs for larger model")
+@click.option("--batch-size", "-b", default=16, type=int, help="Per-GPU batch (16 for larger model)")
+@click.option("--grad-accum", default=2, type=int, help="Gradient accumulation")
+@click.option("--lr", default=3e-4, type=float, help="Higher LR with warmup")
+@click.option("--max-len", default=2048, type=int, help="Longer sequences")
+@click.option("--warmup-ratio", default=0.05, type=float, help="Fraction of steps for warmup")
+@click.option("--weight-decay", default=0.01, type=float)
+@click.option("--text-latents/--no-text-latents", default=False, help="Generate text-derived latents for alignment (slower)")
+@click.option("--num-gpus", type=int, help="Number of GPUs (auto-detect if not set)")
+def train_sd_gcode_v3(
+    manifest: Path, output: Path, sd_model: str, epochs: int,
+    batch_size: int, grad_accum: int, lr: float, max_len: int,
+    warmup_ratio: float, weight_decay: float, text_latents: bool, num_gpus: int | None
+):
+    """Train v3 decoder with comprehensive improvements.
+    
+    Key improvements:
+    - Custom gcode tokenizer (preserves newlines)
+    - Larger decoder (~200M params vs ~50M)
+    - CNN-based latent projection (preserves spatial info)
+    - Cosine LR schedule with warmup
+    - Multi-GPU support via DDP
+    
+    For multi-GPU, launch with:
+        torchrun --nproc_per_node=N dcode train-sd-gcode-v3 ...
+    """
+    from .train_sd_gcode_v3 import train
+
+    result = train(
+        manifest_path=str(manifest),
+        output_dir=str(output),
+        sd_model_id=sd_model,
+        epochs=epochs,
+        batch_size=batch_size,
+        gradient_accumulation=grad_accum,
+        learning_rate=lr,
+        max_gcode_len=max_len,
+        warmup_ratio=warmup_ratio,
+        weight_decay=weight_decay,
+        generate_text_latents=text_latents,
+        num_gpus=num_gpus,
+    )
+    click.echo(f"Saved: {result}")
+
+
 if __name__ == "__main__":
     main()

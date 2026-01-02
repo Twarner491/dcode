@@ -8,6 +8,7 @@ dependencies = [
     "torchvision>=0.15",
     "diffusers>=0.25",
     "transformers>=4.36",
+    "tokenizers>=0.15",
     "accelerate>=0.25",
     "datasets>=2.16",
     "wandb>=0.16",

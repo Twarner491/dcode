@@ -9,6 +9,10 @@ from huggingface_hub import HfApi, create_repo
 TOKEN = os.environ.get("HF_TOKEN")
 api = HfApi(token=TOKEN)
 
+# SD-Gcode v3 model (comprehensive training)
+SD_GCODE_V3_MODEL = "checkpoints/sd_gcode_v3/final"
+SD_GCODE_V3_REPO = "twarner/dcode-sd-gcode-v3"
+
 # SD-Gcode v2 model (correct training)
 SD_GCODE_MODEL = "checkpoints/sd_gcode_v2/final"
 SD_GCODE_REPO = "twarner/dcode-sd-gcode"
@@ -279,6 +283,86 @@ Latent-to-gcode transformer model. See [dcode-sd-gcode](https://huggingface.co/t
 """
 
 
+SD_GCODE_V3_CARD = """---
+license: mit
+language:
+- en
+library_name: diffusers
+tags:
+- gcode
+- polargraph
+- pen-plotter
+- text-to-gcode
+- stable-diffusion
+- diffusion
+datasets:
+- twarner/dcode-polargraph-gcode
+pipeline_tag: text-generation
+---
+
+# dcode-sd-gcode-v3
+
+Text-to-gcode model using Stable Diffusion latents with a comprehensive decoder architecture.
+
+## Model Description
+
+This model combines a frozen Stable Diffusion pipeline with a large trained gcode decoder:
+1. **Text -> Latent**: Stable Diffusion generates image latents from text
+2. **Latent -> Gcode**: CNN + Transformer decoder converts latents to gcode
+
+## V3 Improvements
+
+- **Custom gcode tokenizer**: Preserves newlines and gcode structure (8192 vocab)
+- **Larger decoder**: 12-layer transformer, 1024-dim, ~200M params (vs 50M in v2)
+- **CNN latent projection**: Preserves spatial information from latents
+- **Cosine LR schedule**: With warmup for stable training
+- **Multi-GPU training**: DDP support for faster training
+
+## Architecture
+
+- **Base**: runwayml/stable-diffusion-v1-5 (frozen)
+- **Gcode Decoder**: 12-layer transformer, 1024-dim, 16 heads, ~200M params
+- **Latent Projector**: CNN (4x64x64 -> 16 tokens)
+- **Max gcode length**: 2048 tokens
+
+## Usage
+
+```python
+from diffusers import StableDiffusionPipeline
+from transformers import PreTrainedTokenizerFast
+import torch
+
+# Load SD pipeline
+pipe = StableDiffusionPipeline.from_pretrained("runwayml/stable-diffusion-v1-5")
+
+# Load trained decoder weights from this repo
+# See spaces/dcode for full inference code
+```
+
+Or try the [HuggingFace Space](https://huggingface.co/spaces/twarner/dcode).
+
+## Training
+
+- **Dataset**: 175,952 VAE-encoded image latents with gcode
+- **Epochs**: 20
+- **Hardware**: NVIDIA H100 (80GB)
+- **Batch size**: 16 per GPU x 4 GPUs x 2 grad accum = 128 effective
+- **LR**: 3e-4 with cosine schedule and 5% warmup
+- **Custom tokenizer**: 8192 vocab, trained on gcode corpus
+
+## Machine Limits
+
+Generated gcode is validated for polargraph bounds:
+- X: -420.5 to 420.5 mm
+- Y: -594.5 to 594.5 mm
+- Pen up: 90 deg, Pen down: 40 deg
+
+## License
+
+MIT
+"""
+
+
 def upload_sd_gcode():
     """Upload SD-Gcode v2 model to HuggingFace."""
     print(f"Uploading SD-Gcode model to {SD_GCODE_REPO}...")
@@ -396,10 +480,34 @@ def upload_dataset():
     print(f"Dataset uploaded: https://huggingface.co/datasets/{DATASET_REPO}")
 
 
+def upload_sd_gcode_v3():
+    """Upload SD-Gcode v3 model to HuggingFace."""
+    print(f"Uploading SD-Gcode v3 model to {SD_GCODE_V3_REPO}...")
+    
+    # Create repo
+    create_repo(SD_GCODE_V3_REPO, exist_ok=True, repo_type="model", token=TOKEN)
+    
+    # Write model card
+    model_path = Path(SD_GCODE_V3_MODEL)
+    readme_path = model_path / "README.md"
+    readme_path.write_text(SD_GCODE_V3_CARD, encoding="utf-8")
+    
+    # Upload all files
+    api.upload_folder(
+        folder_path=str(model_path),
+        repo_id=SD_GCODE_V3_REPO,
+        repo_type="model",
+        token=TOKEN,
+    )
+    print(f"SD-Gcode v3 model uploaded: https://huggingface.co/{SD_GCODE_V3_REPO}")
+
+
 if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1:
-        if sys.argv[1] == "sd-gcode":
+        if sys.argv[1] == "sd-gcode-v3":
+            upload_sd_gcode_v3()
+        elif sys.argv[1] == "sd-gcode":
             upload_sd_gcode()
         elif sys.argv[1] == "model":
             upload_model()
@@ -408,8 +516,9 @@ if __name__ == "__main__":
         elif sys.argv[1] == "dataset":
             upload_dataset()
         elif sys.argv[1] == "all":
+            upload_sd_gcode_v3()
             upload_sd_gcode()
             upload_model()
             upload_dataset()
     else:
-        upload_sd_gcode()  # Default to v2 model
+        upload_sd_gcode_v3()  # Default to v3 model
