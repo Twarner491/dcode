@@ -287,18 +287,22 @@ def train_sd_gcode_v2(
 @click.option("--output", "-o", default="checkpoints/sd_gcode_v3", type=Path)
 @click.option("--sd-model", default="runwayml/stable-diffusion-v1-5")
 @click.option("--epochs", "-e", default=20, type=int, help="More epochs for larger model")
-@click.option("--batch-size", "-b", default=16, type=int, help="Per-GPU batch (16 for larger model)")
-@click.option("--grad-accum", default=2, type=int, help="Gradient accumulation")
+@click.option("--batch-size", "-b", default=32, type=int, help="Per-GPU batch (32 fits H100 80GB)")
+@click.option("--grad-accum", default=1, type=int, help="Gradient accumulation (less needed with multi-GPU)")
 @click.option("--lr", default=3e-4, type=float, help="Higher LR with warmup")
 @click.option("--max-len", default=2048, type=int, help="Longer sequences")
 @click.option("--warmup-ratio", default=0.05, type=float, help="Fraction of steps for warmup")
 @click.option("--weight-decay", default=0.01, type=float)
 @click.option("--text-latents/--no-text-latents", default=False, help="Generate text-derived latents for alignment (slower)")
 @click.option("--num-gpus", type=int, help="Number of GPUs (auto-detect if not set)")
+@click.option("--wandb/--no-wandb", default=True, help="Enable wandb logging")
+@click.option("--wandb-project", default="dcode-sd-gcode-v3", help="Wandb project name")
+@click.option("--wandb-run", default=None, help="Wandb run name (auto-generated if not set)")
 def train_sd_gcode_v3(
     manifest: Path, output: Path, sd_model: str, epochs: int,
     batch_size: int, grad_accum: int, lr: float, max_len: int,
-    warmup_ratio: float, weight_decay: float, text_latents: bool, num_gpus: int | None
+    warmup_ratio: float, weight_decay: float, text_latents: bool, num_gpus: int | None,
+    wandb: bool, wandb_project: str, wandb_run: str | None
 ):
     """Train v3 decoder with comprehensive improvements.
     
@@ -308,9 +312,13 @@ def train_sd_gcode_v3(
     - CNN-based latent projection (preserves spatial info)
     - Cosine LR schedule with warmup
     - Multi-GPU support via DDP
+    - Wandb logging for training curves
     
     For multi-GPU, launch with:
         torchrun --nproc_per_node=N dcode train-sd-gcode-v3 ...
+    
+    Optimized for 8x H100:
+        torchrun --nproc_per_node=8 dcode train-sd-gcode-v3 -m data/processed/captioned.json -e 20 -b 32
     """
     from .train_sd_gcode_v3 import train
 
@@ -327,6 +335,9 @@ def train_sd_gcode_v3(
         weight_decay=weight_decay,
         generate_text_latents=text_latents,
         num_gpus=num_gpus,
+        use_wandb=wandb,
+        wandb_project=wandb_project,
+        wandb_run_name=wandb_run,
     )
     click.echo(f"Saved: {result}")
 

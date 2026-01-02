@@ -39,6 +39,13 @@ from typing import Optional
 import warnings
 warnings.filterwarnings("ignore")
 
+# Optional wandb
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+
 
 # ============================================================================
 # CUSTOM GCODE TOKENIZER
@@ -531,14 +538,17 @@ def train(
     output_dir: str = "checkpoints/sd_gcode_v3",
     sd_model_id: str = "runwayml/stable-diffusion-v1-5",
     epochs: int = 20,
-    batch_size: int = 16,
+    batch_size: int = 32,  # Optimized for H100 80GB
     learning_rate: float = 3e-4,
     max_gcode_len: int = 2048,
-    gradient_accumulation: int = 2,
+    gradient_accumulation: int = 1,  # Less needed with 8 GPUs
     warmup_ratio: float = 0.05,
     weight_decay: float = 0.01,
     generate_text_latents: bool = False,  # Set True for better alignment (slower)
     num_gpus: Optional[int] = None,
+    use_wandb: bool = True,
+    wandb_project: str = "dcode-sd-gcode-v3",
+    wandb_run_name: Optional[str] = None,
 ):
     """Train the gcode decoder with comprehensive improvements."""
     
@@ -558,11 +568,34 @@ def train(
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
+    effective_batch = batch_size * world_size * gradient_accumulation
+    
     if rank == 0:
         print(f"Training on {num_gpus} GPU(s)")
-        print(f"Batch size: {batch_size} x {world_size} = {batch_size * world_size} effective")
+        print(f"Batch size: {batch_size} x {world_size} = {batch_size * world_size} per step")
         print(f"Gradient accumulation: {gradient_accumulation}")
-        print(f"Total effective batch: {batch_size * world_size * gradient_accumulation}")
+        print(f"Total effective batch: {effective_batch}")
+    
+    # Initialize wandb (only on rank 0)
+    if use_wandb and WANDB_AVAILABLE and rank == 0:
+        wandb.init(
+            project=wandb_project,
+            name=wandb_run_name or f"v3_{num_gpus}gpu_bs{effective_batch}",
+            config={
+                "epochs": epochs,
+                "batch_size": batch_size,
+                "effective_batch_size": effective_batch,
+                "learning_rate": learning_rate,
+                "max_gcode_len": max_gcode_len,
+                "gradient_accumulation": gradient_accumulation,
+                "warmup_ratio": warmup_ratio,
+                "weight_decay": weight_decay,
+                "num_gpus": num_gpus,
+                "sd_model_id": sd_model_id,
+                "generate_text_latents": generate_text_latents,
+            },
+        )
+        print("Wandb initialized")
     
     output_path = Path(output_dir)
     cache_dir = output_path / "cache"
@@ -702,7 +735,7 @@ def train(
             
             if (batch_idx + 1) % gradient_accumulation == 0:
                 # Gradient clipping
-                torch.nn.utils.clip_grad_norm_(decoder.parameters(), 1.0)
+                grad_norm = torch.nn.utils.clip_grad_norm_(decoder.parameters(), 1.0)
                 
                 optimizer.step()
                 scheduler.step()
@@ -710,7 +743,18 @@ def train(
                 global_step += 1
                 
                 lr = scheduler.get_last_lr()[0]
-                pbar.set_postfix(loss=f"{loss.item() * gradient_accumulation:.4f}", lr=f"{lr:.2e}", step=global_step)
+                step_loss = loss.item() * gradient_accumulation
+                pbar.set_postfix(loss=f"{step_loss:.4f}", lr=f"{lr:.2e}", step=global_step)
+                
+                # Wandb logging (every 10 steps for efficiency)
+                if use_wandb and WANDB_AVAILABLE and rank == 0 and global_step % 10 == 0:
+                    wandb.log({
+                        "train/loss": step_loss,
+                        "train/learning_rate": lr,
+                        "train/grad_norm": grad_norm.item(),
+                        "train/epoch": epoch + batch_idx / len(dataloader),
+                        "train/gpu_memory_gb": torch.cuda.memory_allocated() / 1e9,
+                    }, step=global_step)
                 
                 # Checkpoint
                 if global_step % 2000 == 0 and rank == 0:
@@ -726,6 +770,13 @@ def train(
         
         if rank == 0:
             print(f"Epoch {epoch+1} avg loss: {avg_loss:.4f}")
+            
+            # Wandb epoch logging
+            if use_wandb and WANDB_AVAILABLE:
+                wandb.log({
+                    "epoch/loss": avg_loss,
+                    "epoch/epoch": epoch + 1,
+                }, step=global_step)
         
         if avg_loss < best_loss:
             best_loss = avg_loss
@@ -789,6 +840,13 @@ def train(
         print(f"Best loss: {best_loss:.4f}")
         print(f"Model saved to: {final_path}")
         print(f"{'='*60}")
+        
+        # Final wandb summary
+        if use_wandb and WANDB_AVAILABLE:
+            wandb.summary["best_loss"] = best_loss
+            wandb.summary["total_steps"] = global_step
+            wandb.summary["final_model_path"] = str(final_path)
+            wandb.finish()
     
     if use_ddp:
         cleanup_ddp()
