@@ -1,7 +1,6 @@
 """Image to path converter - ported from JS ImageConverter."""
 
 import math
-import random
 from dataclasses import dataclass
 
 import numpy as np
@@ -16,19 +15,19 @@ class ConverterOptions:
     step_size: float = 2.0
     angle: float = 45.0
     passes: int = 4
-    amplitude: float = 5.0
     box_size: float = 8.0
     cutoff: int = 128
-    turns: int = 5000
+    threshold: int = 128  # For trace_outline
+    density: float = 2.0  # For trace_outline fill spacing
     to_corners: bool = False
+    fill: bool = False  # For trace_outline: fill interior
 
 
 CONVERTERS = {
     "spiral": {"name": "Spiral", "defaults": {"step_size": 2.0, "to_corners": False}},
     "crosshatch": {"name": "Crosshatch", "defaults": {"angle": 45, "step_size": 2.0, "passes": 4}},
-    "pulse": {"name": "Pulse Lines", "defaults": {"step_size": 3.0, "amplitude": 5.0}},
     "squares": {"name": "Concentric Squares", "defaults": {"box_size": 8.0, "cutoff": 128}},
-    "wander": {"name": "Random Walk", "defaults": {"step_size": 1.0, "turns": 5000}},
+    "trace": {"name": "Trace Outline", "defaults": {"threshold": 128, "density": 2.0, "fill": False}},
 }
 
 # Permutations for dataset generation
@@ -43,19 +42,15 @@ ALGORITHM_PERMUTATIONS = {
         {"angle": 45, "step_size": 1.5, "passes": 4},
         {"angle": 60, "step_size": 2.5, "passes": 5},
     ],
-    "pulse": [
-        {"step_size": 2.0, "amplitude": 4.0},
-        {"step_size": 3.0, "amplitude": 6.0},
-        {"step_size": 4.0, "amplitude": 8.0},
-    ],
     "squares": [
         {"box_size": 6.0, "cutoff": 100},
         {"box_size": 8.0, "cutoff": 128},
         {"box_size": 10.0, "cutoff": 150},
     ],
-    "wander": [
-        {"step_size": 0.8, "turns": 8000},
-        {"step_size": 1.2, "turns": 5000},
+    "trace": [
+        {"threshold": 100, "density": 1.5, "fill": False},
+        {"threshold": 128, "density": 2.0, "fill": False},
+        {"threshold": 150, "density": 2.5, "fill": True},
     ],
 }
 
@@ -200,41 +195,6 @@ class ImageConverter:
                     turtle.pen_up_cmd()
                 turtle.position.x, turtle.position.y = x, y
 
-    def _convert_pulse(self, gray, w, h, ox, oy, opts: ConverterOptions) -> Turtle:
-        turtle = Turtle()
-        step = opts.step_size
-        max_amp = opts.amplitude
-
-        row = 0
-        y = oy
-        while y < oy + h:
-            if row % 2 == 0:
-                x_range = range(int(ox), int(ox + w))
-            else:
-                x_range = range(int(ox + w), int(ox), -1)
-
-            first = True
-            for x in x_range:
-                ix = int(x - ox)
-                iy = int(h - 1 - (y - oy))
-
-                if 0 <= ix < w and 0 <= iy < h:
-                    brightness = gray[iy, ix]
-                    amplitude = max_amp * (255 - brightness) / 255
-                    wave = math.sin(x * 0.5) * amplitude
-                    py = y + wave
-
-                    if first:
-                        turtle.jump_to(x, py)
-                        first = False
-                    else:
-                        turtle.move_to(x, py)
-
-            y += step
-            row += 1
-
-        return turtle
-
     def _convert_squares(self, gray, w, h, ox, oy, opts: ConverterOptions) -> Turtle:
         turtle = Turtle()
         box = opts.box_size
@@ -265,41 +225,105 @@ class ImageConverter:
 
         return turtle
 
-    def _convert_wander(self, gray, w, h, ox, oy, opts: ConverterOptions) -> Turtle:
+    def _convert_trace(self, gray, w, h, ox, oy, opts: ConverterOptions) -> Turtle:
+        """Trace outline converter.
+        
+        Thresholds image to binary, then traces edges using scan-line approach.
+        Each contiguous run of edge pixels becomes a line segment.
+        
+        For fills, scans the full binary mask (not just edges) with spacing
+        controlled by density parameter.
+        """
         turtle = Turtle()
-        step = opts.step_size
-        max_turns = opts.turns
-
-        x, y = ox + w / 2, oy + h / 2
-        angle = random.random() * 2 * math.pi
-
-        turtle.jump_to(x, y)
-
-        for _ in range(max_turns):
-            brightness = self._sample(gray, w, h, x, y, ox, oy)
-            turn = (brightness / 255.0) * math.pi / 2
-            angle += (random.random() - 0.5) * turn
-
-            nx = x + math.cos(angle) * step
-            ny = y + math.sin(angle) * step
-
-            if nx < ox or nx > ox + w:
-                angle = math.pi - angle
-                nx = x + math.cos(angle) * step
-            if ny < oy or ny > oy + h:
-                angle = -angle
-                ny = y + math.sin(angle) * step
-
-            x, y = nx, ny
-
-            if self._sample(gray, w, h, x, y, ox, oy) < 200:
-                if turtle.pen_up:
-                    turtle.jump_to(x, y)
+        threshold = opts.threshold
+        density = opts.density
+        do_fill = opts.fill
+        
+        # Threshold to binary: dark pixels = shape (1), light = background (0)
+        binary = (gray < threshold).astype(np.uint8)
+        
+        if do_fill:
+            # Fill mode: scan entire shape
+            mask = binary
+        else:
+            # Edge mode: find edge pixels
+            # Edge = dark pixel with at least one 4-connected light neighbor
+            mask = np.zeros_like(binary)
+            for iy in range(h):
+                for ix in range(w):
+                    if binary[iy, ix] == 1:
+                        # Check 4-connected neighbors
+                        is_edge = False
+                        for dy, dx in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                            ny, nx = iy + dy, ix + dx
+                            if ny < 0 or ny >= h or nx < 0 or nx >= w:
+                                is_edge = True  # Out of bounds = edge
+                                break
+                            if binary[ny, nx] == 0:
+                                is_edge = True  # Light neighbor = edge
+                                break
+                        if is_edge:
+                            mask[iy, ix] = 1
+        
+        # Horizontal scan: for each row, find contiguous runs of mask pixels
+        step = max(1, int(density))
+        for iy in range(0, h, step):
+            segments = []
+            in_segment = False
+            seg_start = 0
+            
+            for ix in range(w):
+                if mask[iy, ix] == 1:
+                    if not in_segment:
+                        in_segment = True
+                        seg_start = ix
                 else:
-                    turtle.move_to(x, y)
-            else:
-                turtle.pen_up_cmd()
-                turtle.position.x, turtle.position.y = x, y
-
+                    if in_segment:
+                        in_segment = False
+                        segments.append((seg_start, ix - 1))
+            
+            if in_segment:
+                segments.append((seg_start, w - 1))
+            
+            # Draw each segment
+            for start_x, end_x in segments:
+                if end_x > start_x:  # At least 2 pixels
+                    # Convert image coords to world coords
+                    x0 = ox + start_x
+                    x1 = ox + end_x
+                    y = oy + (h - 1 - iy)  # Flip Y
+                    
+                    turtle.jump_to(x0, y)
+                    turtle.move_to(x1, y)
+        
+        # Vertical scan: for each column, find contiguous runs
+        for ix in range(0, w, step):
+            segments = []
+            in_segment = False
+            seg_start = 0
+            
+            for iy in range(h):
+                if mask[iy, ix] == 1:
+                    if not in_segment:
+                        in_segment = True
+                        seg_start = iy
+                else:
+                    if in_segment:
+                        in_segment = False
+                        segments.append((seg_start, iy - 1))
+            
+            if in_segment:
+                segments.append((seg_start, h - 1))
+            
+            # Draw each segment
+            for start_y, end_y in segments:
+                if end_y > start_y:  # At least 2 pixels
+                    x = ox + ix
+                    y0 = oy + (h - 1 - start_y)  # Flip Y
+                    y1 = oy + (h - 1 - end_y)
+                    
+                    turtle.jump_to(x, y0)
+                    turtle.move_to(x, y1)
+        
         return turtle
 
