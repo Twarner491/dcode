@@ -363,65 +363,63 @@ def pre_encode_dataset_v3(
     max_gcode_len: int,
     cache_dir: Path,
     batch_size: int = 64,  # Batch for VAE encoding
-    num_workers: int = 16,  # Conservative thread count
+    num_workers: int = 32,  # Use more CPU threads
     generate_text_latents: bool = True,
     rank: int = 0,  # For DDP
+    world_size: int = 1,  # Total GPUs
 ) -> AlignedLatentDataset:
-    """Pre-encode images (and optionally text) to latents."""
+    """Pre-encode images (and optionally text) to latents.
     
-    # All ranks use the same cache file (rank 0 creates it)
-    cache_file = cache_dir / "latents_v3.pt"
+    DISTRIBUTED: Each GPU encodes 1/world_size of the dataset in parallel,
+    then rank 0 combines all shards into a single cache file.
+    """
     
-    # Non-rank-0 processes wait for cache file to exist
-    if rank != 0:
-        import time
-        max_wait = 7200  # 2 hours max wait
-        waited = 0
-        while not cache_file.exists() and waited < max_wait:
-            time.sleep(10)
-            waited += 10
-        if not cache_file.exists():
-            raise RuntimeError(f"Cache file not created by rank 0 after {max_wait}s")
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    final_cache = cache_dir / "latents_v3.pt"
+    shard_cache = cache_dir / f"latents_v3_rank{rank}.pt"
     
-    if cache_file.exists():
+    # Check if final combined cache exists
+    if final_cache.exists():
         if rank == 0:
-            print(f"Loading cached data from {cache_file}")
-        data = torch.load(cache_file, weights_only=False)
+            print(f"Loading cached data from {final_cache}")
+        data = torch.load(final_cache, weights_only=False)
         return AlignedLatentDataset(
             data["image_latents"],
             data.get("text_latents"),
             data["gcode_ids"],
         )
     
-    # Only rank 0 creates the cache
-    if rank != 0:
-        raise RuntimeError("Non-rank-0 should have loaded from cache")
-    
-    if rank == 0:
-        print("Pre-encoding dataset...")
-    
-    # Load manifest
+    # Load manifest (all ranks need this to determine their shard)
     with open(manifest_path) as f:
         manifest = json.load(f)
     
     pairs = manifest.get("pairs", manifest) if isinstance(manifest, dict) else manifest
     
     # Gather valid samples with captions
-    samples = []
+    all_samples = []
     for item in pairs:
         img_path = Path(item.get("image", ""))
         gcode_path = Path(item.get("gcode", ""))
         caption = item.get("caption", "")
         
         if img_path.exists() and gcode_path.exists():
-            samples.append({
+            all_samples.append({
                 "image": img_path,
                 "gcode": gcode_path,
                 "caption": caption or "artwork",
             })
     
     if rank == 0:
-        print(f"Found {len(samples)} valid samples")
+        print(f"Found {len(all_samples)} valid samples total")
+        print(f"Encoding with {world_size} GPUs in parallel...")
+    
+    # SHARD: Each rank processes 1/world_size of the data
+    samples_per_rank = len(all_samples) // world_size
+    start_idx = rank * samples_per_rank
+    end_idx = start_idx + samples_per_rank if rank < world_size - 1 else len(all_samples)
+    samples = all_samples[start_idx:end_idx]
+    
+    print(f"[Rank {rank}] Processing samples {start_idx} to {end_idx} ({len(samples)} samples)")
     
     # Image transform
     transform = T.Compose([
@@ -434,7 +432,6 @@ def pre_encode_dataset_v3(
     all_text_latents = []
     all_gcode_ids = []
     
-    # Process in batches with parallel I/O
     device = vae.device
     dtype = vae.dtype
     
@@ -450,92 +447,141 @@ def pre_encode_dataset_v3(
         except Exception:
             return None, None, None, False
     
-    for i in tqdm(range(0, len(samples), batch_size), desc="Encoding", disable=rank != 0):
+    def tokenize_gcode(gcode):
+        gcode_clean = gcode.replace("\n", " <newline> ")
+        return tokenizer.encode(
+            gcode_clean,
+            max_length=max_gcode_len,
+            truncation=True,
+            padding="max_length",
+            return_tensors="pt",
+        ).squeeze(0)
+    
+    # Process this rank's shard
+    for i in tqdm(range(0, len(samples), batch_size), desc=f"[Rank {rank}] Encoding"):
         batch_samples = samples[i:i + batch_size]
         
-        # Parallel I/O loading
+        # Parallel I/O loading with more workers
         with ThreadPoolExecutor(max_workers=num_workers) as executor:
             results = list(executor.map(load_sample, batch_samples))
         
         imgs = []
         gcodes = []
         captions = []
-        valid = []
         
         for img_tensor, gcode, caption, is_valid in results:
             if is_valid:
                 imgs.append(img_tensor)
                 gcodes.append(gcode)
                 captions.append(caption)
-            valid.append(is_valid)
         
-        if not any(valid):
+        if not imgs:
             continue
         
         imgs = torch.stack(imgs).to(device, dtype)
         
-        # Encode images to latents
+        # Encode images to latents (GPU intensive)
         with torch.no_grad():
             image_latents = vae.encode(imgs).latent_dist.sample()
             image_latents = image_latents * vae.config.scaling_factor
         
         all_image_latents.append(image_latents.cpu())
         
-        # Optionally generate text latents via diffusion
+        # Generate text latents via diffusion (GPU intensive)
         if generate_text_latents and sd_pipe is not None:
             with torch.no_grad():
-                # Use few steps for efficiency
                 text_results = sd_pipe(
                     captions,
-                    num_inference_steps=10,
+                    num_inference_steps=5,  # Reduced from 10 for speed
                     guidance_scale=7.5,
                     output_type="latent",
                 )
                 text_latents = text_results.images
             all_text_latents.append(text_latents.cpu())
         
-        # Tokenize gcode in parallel
-        def tokenize_gcode(gcode):
-            gcode_clean = gcode.replace("\n", " <newline> ")
-            return tokenizer.encode(
-                gcode_clean,
-                max_length=max_gcode_len,
-                truncation=True,
-                padding="max_length",
-                return_tensors="pt",
-            ).squeeze(0)
-        
+        # Tokenize gcode in parallel (CPU intensive)
         with ThreadPoolExecutor(max_workers=num_workers) as executor:
             tokens_list = list(executor.map(tokenize_gcode, gcodes))
         
         all_gcode_ids.extend(tokens_list)
     
-    # Stack all
-    all_image_latents = torch.cat(all_image_latents, dim=0)
-    all_gcode_ids = torch.stack(all_gcode_ids)
-    
-    if all_text_latents:
-        all_text_latents = torch.cat(all_text_latents, dim=0)
+    # Stack this rank's results
+    if all_image_latents:
+        all_image_latents = torch.cat(all_image_latents, dim=0)
+        all_gcode_ids = torch.stack(all_gcode_ids)
+        if all_text_latents:
+            all_text_latents = torch.cat(all_text_latents, dim=0)
+        else:
+            all_text_latents = None
     else:
+        all_image_latents = torch.empty(0, 4, 64, 64)
+        all_gcode_ids = torch.empty(0, max_gcode_len, dtype=torch.long)
         all_text_latents = None
     
-    if rank == 0:
-        print(f"Encoded {len(all_image_latents)} samples")
-        print(f"Image latents: {all_image_latents.shape}")
-        if all_text_latents is not None:
-            print(f"Text latents: {all_text_latents.shape}")
-        print(f"Gcode tokens: {all_gcode_ids.shape}")
+    print(f"[Rank {rank}] Encoded {len(all_image_latents)} samples")
     
-    # Cache (only rank 0 saves)
-    cache_dir.mkdir(parents=True, exist_ok=True)
+    # Save this rank's shard
     torch.save({
         "image_latents": all_image_latents,
         "text_latents": all_text_latents,
         "gcode_ids": all_gcode_ids,
-    }, cache_file)
-    print(f"Cached to {cache_file}")
+    }, shard_cache)
+    print(f"[Rank {rank}] Saved shard to {shard_cache}")
     
-    return AlignedLatentDataset(all_image_latents, all_text_latents, all_gcode_ids)
+    # Synchronize all ranks
+    if world_size > 1:
+        dist.barrier()
+    
+    # Rank 0 combines all shards
+    if rank == 0:
+        print("Combining shards from all ranks...")
+        combined_image = []
+        combined_text = []
+        combined_gcode = []
+        
+        for r in range(world_size):
+            shard_path = cache_dir / f"latents_v3_rank{r}.pt"
+            shard = torch.load(shard_path, weights_only=False)
+            combined_image.append(shard["image_latents"])
+            if shard.get("text_latents") is not None:
+                combined_text.append(shard["text_latents"])
+            combined_gcode.append(shard["gcode_ids"])
+        
+        all_image_latents = torch.cat(combined_image, dim=0)
+        all_gcode_ids = torch.cat(combined_gcode, dim=0)
+        all_text_latents = torch.cat(combined_text, dim=0) if combined_text else None
+        
+        print(f"Combined: {len(all_image_latents)} samples")
+        print(f"Image latents: {all_image_latents.shape}")
+        if all_text_latents is not None:
+            print(f"Text latents: {all_text_latents.shape}")
+        print(f"Gcode tokens: {all_gcode_ids.shape}")
+        
+        # Save combined cache
+        torch.save({
+            "image_latents": all_image_latents,
+            "text_latents": all_text_latents,
+            "gcode_ids": all_gcode_ids,
+        }, final_cache)
+        print(f"Saved combined cache to {final_cache}")
+        
+        # Clean up shard files
+        for r in range(world_size):
+            shard_path = cache_dir / f"latents_v3_rank{r}.pt"
+            if shard_path.exists():
+                shard_path.unlink()
+    
+    # Wait for rank 0 to finish combining
+    if world_size > 1:
+        dist.barrier()
+    
+    # All ranks load the final combined cache
+    data = torch.load(final_cache, weights_only=False)
+    return AlignedLatentDataset(
+        data["image_latents"],
+        data.get("text_latents"),
+        data["gcode_ids"],
+    )
 
 
 # ============================================================================
@@ -656,10 +702,10 @@ def train(
     vae.eval()
     vae.requires_grad_(False)
     
-    # ========== Optionally load SD for text latents ==========
+    # ========== Optionally load SD for text latents (ALL ranks need this for parallel encoding) ==========
     sd_pipe = None
-    if generate_text_latents and rank == 0:
-        print("Loading SD pipeline for text latent generation...")
+    if generate_text_latents:
+        print(f"[Rank {rank}] Loading SD pipeline for text latent generation...")
         sd_pipe = StableDiffusionPipeline.from_pretrained(
             sd_model_id, torch_dtype=torch.float16, safety_checker=None
         ).to(device)
@@ -681,7 +727,7 @@ def train(
         tokenizer = build_gcode_tokenizer(gcode_files, cache_dir, vocab_size=8192)  # Load cached
     
     # ========== Pre-encode dataset ==========
-    # All ranks call this - rank 0 encodes, others load from cache
+    # ALL ranks encode in parallel (each encodes 1/world_size of data)
     dataset = pre_encode_dataset_v3(
         Path(manifest_path),
         vae,
@@ -690,9 +736,10 @@ def train(
         max_gcode_len,
         cache_dir,
         batch_size=64,
-        num_workers=8,  # Conservative
+        num_workers=32,  # Use more CPU threads
         generate_text_latents=generate_text_latents,
         rank=rank,
+        world_size=world_size,
     )
     
     # Sync after encoding

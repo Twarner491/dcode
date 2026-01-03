@@ -1,0 +1,3 @@
+wonderful! i want to uplaod this new dataset to huggingface. in your upload, preserve the proper image net sub folder strcutre. while creating our dataset, we copied each image so we have the same number of gcode as images, but i dont want to upload iamge copies. we should only upload single copies of each image, catagoriezed into their proper sub folders. additioanlly, gcode should be in a seprate directory, with its own Image net labeld sub foldres, and an additional set of sub folders, groping the different algorithims of generations by image.
+
+all this should be uploaded to huggingface with a simple, yet comprehensive, dataset card
