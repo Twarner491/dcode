@@ -9,6 +9,44 @@ from PIL import Image
 from tqdm import tqdm
 
 
+from .imagenet_classes import synset_to_name
+
+
+def get_imagenet_class_name(folder_name: str) -> str:
+    """Get human-readable class name from ImageNet folder (WordNet ID)."""
+    return synset_to_name(folder_name)
+
+
+def caption_imagenet_sketch(manifest_path: Path, output_path: Path) -> int:
+    """Add captions to ImageNet-Sketch manifest using folder names as class labels.
+    
+    ImageNet-Sketch structure: sketch/{wordnet_id}/{image}.JPEG
+    Caption = "a sketch of a {class_name}"
+    """
+    with open(manifest_path) as f:
+        manifest = json.load(f)
+    
+    captioned = []
+    
+    for pair in tqdm(manifest["pairs"], desc="Captioning from folder names"):
+        img_path = Path(pair.get("image", pair.get("source", "")))
+        
+        # Extract class from folder structure: .../sketch/n01440764/image.JPEG
+        folder_name = img_path.parent.name
+        class_name = get_imagenet_class_name(folder_name)
+        
+        # Create BLIP-style caption for consistency
+        caption = f"a sketch of a {class_name}"
+        
+        captioned.append({**pair, "caption": caption})
+    
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w") as f:
+        json.dump({"pairs": captioned, "stats": manifest.get("stats", {})}, f, indent=2)
+    
+    return len(captioned)
+
+
 def caption_images(manifest_path: Path, output_path: Path, device: str = "cuda"):
     """Generate BLIP captions for all images in manifest."""
     from transformers import BlipForConditionalGeneration, BlipProcessor

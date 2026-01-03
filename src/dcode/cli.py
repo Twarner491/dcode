@@ -38,6 +38,23 @@ def caption(manifest: Path, output: Path):
     click.echo(f"Captioned {n} images → {output}")
 
 
+@main.command("caption-imagenet")
+@click.option("--manifest", "-m", required=True, type=Path)
+@click.option("--output", "-o", required=True, type=Path)
+def caption_imagenet(manifest: Path, output: Path):
+    """Add captions to ImageNet-Sketch dataset using folder names.
+    
+    ImageNet-Sketch structure: sketch/{synset_id}/{image}.JPEG
+    Caption = "a sketch of a {class_name}"
+    
+    Much faster than BLIP since it uses folder names directly.
+    """
+    from .dataset import caption_imagenet_sketch
+
+    n = caption_imagenet_sketch(manifest, output)
+    click.echo(f"Captioned {n} images → {output}")
+
+
 @main.command()
 @click.option("--manifest", "-m", required=True, type=Path)
 @click.option("--model", default="flan-t5-small", help="Model name or path")
