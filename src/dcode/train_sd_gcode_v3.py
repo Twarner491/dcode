@@ -312,10 +312,11 @@ class AlignedLatentDataset(Dataset):
     """Dataset with pre-computed latents for fast training.
     
     Contains both:
-    - Image latents (from VAE) - what the model should decode
-    - Text-derived latents (from SD diffusion) - what we'll use at inference
+    - Image latents (from VAE) - deterministic, clean training signal
+    - Text-derived latents (from SD diffusion) - matches inference distribution
     
     Training on both helps align the decoder to work with diffusion outputs.
+    Key insight: text latents are noisier but match what we'll see at inference.
     """
     
     def __init__(
@@ -323,7 +324,7 @@ class AlignedLatentDataset(Dataset):
         image_latents: torch.Tensor,
         text_latents: Optional[torch.Tensor],
         gcode_ids: torch.Tensor,
-        mix_ratio: float = 0.5,  # Fraction of text latents to use
+        mix_ratio: float = 0.3,  # 30% text, 70% image for stable training
     ):
         self.image_latents = image_latents
         self.text_latents = text_latents
@@ -335,7 +336,11 @@ class AlignedLatentDataset(Dataset):
     
     def __getitem__(self, idx):
         # Randomly choose image or text latent
-        if self.text_latents is not None and torch.rand(1).item() < self.mix_ratio:
+        # Image latents = clean, deterministic (ground truth)
+        # Text latents = noisy, from diffusion (matches inference)
+        use_text = self.text_latents is not None and torch.rand(1).item() < self.mix_ratio
+        
+        if use_text:
             latent = self.text_latents[idx]
         else:
             latent = self.image_latents[idx]
@@ -578,14 +583,15 @@ def train(
     manifest_path: str,
     output_dir: str = "checkpoints/sd_gcode_v3",
     sd_model_id: str = "runwayml/stable-diffusion-v1-5",
-    epochs: int = 20,
+    epochs: int = 50,  # More epochs for overnight training
     batch_size: int = 32,  # Optimized for H100 80GB
-    learning_rate: float = 3e-4,
+    learning_rate: float = 1e-4,  # Lower LR for longer training
     max_gcode_len: int = 2048,
     gradient_accumulation: int = 1,  # Less needed with 8 GPUs
-    warmup_ratio: float = 0.05,
-    weight_decay: float = 0.01,
-    generate_text_latents: bool = False,  # Set True for better alignment (slower)
+    warmup_ratio: float = 0.1,  # More warmup for stability
+    weight_decay: float = 0.05,  # Stronger regularization
+    generate_text_latents: bool = True,  # Enable for text-latent alignment
+    label_smoothing: float = 0.1,  # Prevent overconfidence
     num_gpus: Optional[int] = None,
     use_wandb: bool = True,
     wandb_project: str = "dcode-sd-gcode-v3",
@@ -631,6 +637,7 @@ def train(
                 "gradient_accumulation": gradient_accumulation,
                 "warmup_ratio": warmup_ratio,
                 "weight_decay": weight_decay,
+                "label_smoothing": label_smoothing,
                 "num_gpus": num_gpus,
                 "sd_model_id": sd_model_id,
                 "generate_text_latents": generate_text_latents,
@@ -780,6 +787,7 @@ def train(
                     logits.reshape(-1, logits.size(-1)),
                     decoder_target.reshape(-1),
                     ignore_index=tokenizer.pad_token_id,
+                    label_smoothing=label_smoothing,  # Prevent overconfidence
                 )
                 loss = loss / gradient_accumulation
             

@@ -42,8 +42,8 @@ def _process_image(args, config_dict, output_dir):
             try:
                 img.save(out_img)
                 turtle = converter.convert(img, algo, options)
-                comment = f"Source: {img_path.name} | Algorithm: {algo} | Options: {options}"
-                gcode = exporter.export(turtle, comment)
+                # No metadata comment - keep gcode clean for training
+                gcode = exporter.export(turtle, comment="")
                 out_gcode.write_text(gcode)
 
                 results.append({

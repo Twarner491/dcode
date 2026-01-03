@@ -286,14 +286,15 @@ def train_sd_gcode_v2(
 @click.option("--manifest", "-m", required=True, type=Path)
 @click.option("--output", "-o", default="checkpoints/sd_gcode_v3", type=Path)
 @click.option("--sd-model", default="runwayml/stable-diffusion-v1-5")
-@click.option("--epochs", "-e", default=20, type=int, help="More epochs for larger model")
+@click.option("--epochs", "-e", default=50, type=int, help="More epochs for overnight training")
 @click.option("--batch-size", "-b", default=32, type=int, help="Per-GPU batch (32 fits H100 80GB)")
-@click.option("--grad-accum", default=1, type=int, help="Gradient accumulation (less needed with multi-GPU)")
-@click.option("--lr", default=3e-4, type=float, help="Higher LR with warmup")
+@click.option("--grad-accum", default=1, type=int, help="Gradient accumulation")
+@click.option("--lr", default=1e-4, type=float, help="Lower LR for longer training")
 @click.option("--max-len", default=2048, type=int, help="Longer sequences")
-@click.option("--warmup-ratio", default=0.05, type=float, help="Fraction of steps for warmup")
-@click.option("--weight-decay", default=0.01, type=float)
-@click.option("--text-latents/--no-text-latents", default=False, help="Generate text-derived latents for alignment (slower)")
+@click.option("--warmup-ratio", default=0.1, type=float, help="Fraction of steps for warmup")
+@click.option("--weight-decay", default=0.05, type=float, help="Stronger regularization")
+@click.option("--label-smoothing", default=0.1, type=float, help="Label smoothing")
+@click.option("--text-latents/--no-text-latents", default=True, help="Generate text-derived latents for alignment")
 @click.option("--num-gpus", type=int, help="Number of GPUs (auto-detect if not set)")
 @click.option("--wandb/--no-wandb", default=True, help="Enable wandb logging")
 @click.option("--wandb-project", default="dcode-sd-gcode-v3", help="Wandb project name")
@@ -301,24 +302,24 @@ def train_sd_gcode_v2(
 def train_sd_gcode_v3(
     manifest: Path, output: Path, sd_model: str, epochs: int,
     batch_size: int, grad_accum: int, lr: float, max_len: int,
-    warmup_ratio: float, weight_decay: float, text_latents: bool, num_gpus: int | None,
+    warmup_ratio: float, weight_decay: float, label_smoothing: float,
+    text_latents: bool, num_gpus: int | None,
     wandb: bool, wandb_project: str, wandb_run: str | None
 ):
     """Train v3 decoder with comprehensive improvements.
     
     Key improvements:
     - Custom gcode tokenizer (preserves newlines)
-    - Larger decoder (~200M params vs ~50M)
-    - CNN-based latent projection (preserves spatial info)
+    - Larger decoder (~200M params)
+    - CNN-based latent projection
     - Cosine LR schedule with warmup
+    - Text-latent alignment training
+    - Label smoothing regularization
     - Multi-GPU support via DDP
-    - Wandb logging for training curves
     
-    For multi-GPU, launch with:
-        torchrun --nproc_per_node=N dcode train-sd-gcode-v3 ...
-    
-    Optimized for 8x H100:
-        torchrun --nproc_per_node=8 dcode train-sd-gcode-v3 -m data/processed/captioned.json -e 20 -b 32
+    Overnight training on 8x H100:
+        torchrun --nproc_per_node=8 -m dcode.train_sd_gcode_v3 \\
+            data/processed/captioned.json --epochs 50 --text-latents
     """
     from .train_sd_gcode_v3 import train
 
@@ -333,6 +334,7 @@ def train_sd_gcode_v3(
         max_gcode_len=max_len,
         warmup_ratio=warmup_ratio,
         weight_decay=weight_decay,
+        label_smoothing=label_smoothing,
         generate_text_latents=text_latents,
         num_gpus=num_gpus,
         use_wandb=wandb,
