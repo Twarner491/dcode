@@ -218,4 +218,11 @@ def upload_model(
 
 
 if __name__ == "__main__":
-    import argparse
+    import argparse
+    parser = argparse.ArgumentParser(description="Upload dcode model to HuggingFace")
+    parser.add_argument("--checkpoint", "-c", default="checkpoints/sd_gcode_v3/final",
+                        help="Path to checkpoint directory")
+    parser.add_argument("--repo", "-r", default="twarner/dcode-sd-gcode-v3",
+                        help="HuggingFace repo ID")
+    args = parser.parse_args()
+    upload_model(checkpoint_dir=args.checkpoint, repo_id=args.repo)
