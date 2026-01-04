@@ -155,7 +155,7 @@ MIT License
 
 
 def upload_model(
-    checkpoint_dir: str = "checkpoints/sd_gcode_v3_imagenet/final",
+    checkpoint_dir: str = "checkpoints/sd_gcode_v3/final",
     repo_id: str = "twarner/dcode-sd-gcode-v3",
 ):
     """Upload trained model to HuggingFace."""
@@ -170,8 +170,22 @@ def upload_model(
     checkpoint = Path(checkpoint_dir)
     
     if not checkpoint.exists():
-        print(f"Checkpoint not found: {checkpoint}")
-        return
+        # Try fallback paths
+        fallbacks = [
+            Path("checkpoints/sd_gcode_v3/final"),
+            Path("checkpoints/sd_gcode_v3"),
+            Path("checkpoints/sd_gcode_v3_imagenet/final"),
+            Path("checkpoints/sd_gcode_v3_imagenet"),
+        ]
+        for fb in fallbacks:
+            if fb.exists():
+                checkpoint = fb
+                print(f"Using checkpoint: {checkpoint}")
+                break
+        else:
+            print(f"Checkpoint not found: {checkpoint_dir}")
+            print(f"Also tried: {[str(f) for f in fallbacks]}")
+            return
     
     # Create temp upload directory
     upload_dir = Path("upload_model_temp")
@@ -204,4 +218,4 @@ def upload_model(
 
 
 if __name__ == "__main__":
-    upload_model()
+    import argparse
